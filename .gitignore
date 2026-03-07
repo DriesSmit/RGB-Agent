@@ -1,0 +1,32 @@
+.DS_Store
+
+wandb/
+checkpoints/
+
+venv/
+.venv/
+env/
+.env
+.env.*
+
+evaluation_results/
+
+memory/
+
+__pycache__/
+*.pyc
+*.pyo
+
+*.egg-info/
+dist/
+build/
+
+outputs/
+
+# IDE / editor
+.vscode/
+.idea/
+
+# Claude Code
+.claude/
+
