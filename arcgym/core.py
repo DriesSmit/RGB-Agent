@@ -1,9 +1,4 @@
-"""
-Minimal base classes and data structures for agents and environments.
-
-Inlined from rllm to remove the submodule dependency — only the parts
-actually used by arcgym are kept.
-"""
+"""Minimal base classes and data structures for agents and environments."""
 from __future__ import annotations
 
 import uuid
@@ -12,13 +7,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-# ---------------------------------------------------------------------------
-# Agent data structures
-# ---------------------------------------------------------------------------
-
 @dataclass
 class Step:
-    """A single step in an agent trajectory."""
     observation: Any = None
     action: Any = None
     model_response: str = ""
@@ -30,19 +20,12 @@ class Step:
 
 @dataclass
 class Trajectory:
-    """Ordered sequence of Steps for one episode."""
     uid: str = field(default_factory=lambda: str(uuid.uuid4()))
     name: str = "agent"
     steps: list[Step] = field(default_factory=list)
 
 
-# ---------------------------------------------------------------------------
-# Base classes
-# ---------------------------------------------------------------------------
-
 class BaseAgent(ABC):
-    """Minimal abstract agent interface."""
-
     @property
     def trajectory(self) -> Trajectory:
         return Trajectory()
@@ -59,8 +42,6 @@ class BaseAgent(ABC):
 
 
 class BaseEnv(ABC):
-    """Minimal abstract environment interface."""
-
     @abstractmethod
     def reset(self) -> tuple[dict, dict]:
         pass

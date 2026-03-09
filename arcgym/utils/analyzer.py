@@ -1,9 +1,7 @@
-"""
-OpenCode-based prompt log analyzer.
+"""OpenCode-based prompt log analyzer.
 
-Spawns `opencode run` inside a Docker sandbox to analyze the agent's
-prompt log. All write/web/edit tools are explicitly denied via a generated
-opencode.json config file.
+Spawns `opencode` inside a Docker sandbox to analyze the agent's prompt log
+and produce batch action plans.
 """
 from __future__ import annotations
 
@@ -19,15 +17,15 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Literal, Optional
+from typing import Callable, IO, Literal, Optional
 
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Prompt templates (shared constants)
+# Prompt templates
 # ---------------------------------------------------------------------------
 
-ANALYSIS_PROMPT = """\
+_INITIAL_PROMPT = """\
 You are a strategic advisor for an AI agent playing a grid-based puzzle game.
 The agent's full prompt log for this run is at this ABSOLUTE path: {log_path}
 
@@ -46,7 +44,7 @@ Your response MUST contain ALL sections below — the agent cannot act without [
 <concise action plan the agent should follow until the next analysis>
 """
 
-_RESUME_FOLLOW_UP_PROMPT = """\
+_RESUME_PROMPT = """\
 The prompt log has grown since your last analysis. The log file is at: {log_path}
 
 Re-read the latest actions (from where you left off) and update your strategic briefing.
@@ -101,22 +99,238 @@ _PYTHON_ADDENDUM = (
     "Run Python inline."
 )
 
-_HAS_DOCKER = shutil.which("docker") is not None
 _DOCKER_IMAGE = os.environ.get("OPENCODE_DOCKER_IMAGE", "arcgym/opencode-sandbox:latest")
 
 
 def _docker_image_exists(image: str) -> bool:
-    """Check if the Docker image exists locally."""
     try:
         result = subprocess.run(
             ["docker", "image", "inspect", image],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=10,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
         )
         return result.returncode == 0
     except Exception:
         return False
 
+
+# ---------------------------------------------------------------------------
+# Event stream parser — deduplicates the per-event-type file writing
+# ---------------------------------------------------------------------------
+
+class _EventStreamParser:
+    """Parses nd-JSON events from opencode and writes to an analyzer log."""
+
+    def __init__(self, f: IO[str]):
+        self._f = f
+        self.accumulated_text = ""
+        self.session_id: str | None = None
+
+    def _write(self, label: str, content: str) -> None:
+        if content:
+            self._f.write(f"[{label}]\n{content}\n\n")
+            self._f.flush()
+
+    def _write_tool(self, name: str, state: dict) -> None:
+        status = state.get("status", "?")
+        if status in ("running", "completed", "done"):
+            input_data = state.get("input", {})
+            input_str = json.dumps(input_data, indent=2) if isinstance(input_data, dict) else str(input_data)
+            self._write(f"TOOL CALL: {name}", input_str)
+        if status in ("completed", "done"):
+            output = state.get("output", state.get("result", ""))
+            is_error = state.get("is_error", False) or state.get("error", False)
+            label = "TOOL RESULT ERROR" if is_error else "TOOL RESULT"
+            self._write(label, str(output)[:4000])
+
+    def handle(self, event: dict) -> None:
+        etype = event.get("type")
+        log.debug("event type=%s", etype)
+
+        if etype == "step_start":
+            sid = event.get("sessionID")
+            if sid and not self.session_id:
+                self.session_id = sid
+
+        elif etype == "text":
+            text = event.get("part", {}).get("text", "")
+            if text:
+                self.accumulated_text += text
+                self._write("ASSISTANT", text)
+
+        elif etype == "tool_use":
+            part = event.get("part", {})
+            self._write_tool(part.get("tool", "?"), part.get("state", {}))
+
+        elif etype == "message.part.updated":
+            part = event.get("part", {})
+            ptype = part.get("type")
+            if ptype in ("thinking", "reasoning"):
+                self._write("THINKING", part.get("text", ""))
+            elif ptype == "tool":
+                name = part.get("name", "?")
+                pstate = part.get("state", "?")
+                if pstate == "running":
+                    input_data = part.get("input", {})
+                    input_str = json.dumps(input_data, indent=2) if isinstance(input_data, dict) else str(input_data)
+                    self._write(f"TOOL CALL: {name}", input_str)
+                elif pstate in ("completed", "done"):
+                    result = part.get("result", part.get("output", ""))
+                    text = result if isinstance(result, str) else str(result)
+                    is_error = part.get("is_error", False) or part.get("error", False)
+                    label = "TOOL RESULT ERROR" if is_error else "TOOL RESULT"
+                    self._write(label, text[:4000])
+
+        elif etype == "error":
+            err = event.get("error", {})
+            name = err.get("name", "UnknownError")
+            msg = err.get("data", {}).get("message", str(err))
+            self._write(f"ERROR: {name}", msg)
+            log.error("API error: %s: %s", name, msg)
+            if "overflow" in name.lower() or "too long" in msg.lower():
+                self.session_id = None  # force fresh session
+
+        elif etype == "step_finish":
+            cost = event.get("part", {}).get("cost")
+            self._write("RESULT", f"cost=${cost}")
+
+        elif etype == "assistant":
+            for block in event.get("message", {}).get("content", []):
+                btype = block.get("type")
+                if btype == "thinking":
+                    self._write("THINKING", block.get("thinking", ""))
+                elif btype == "text":
+                    text = block["text"]
+                    self.accumulated_text += text
+                    self._write("ASSISTANT", text)
+                elif btype == "tool_use":
+                    self._write(f"TOOL CALL: {block['name']}", json.dumps(block.get("input", {}), indent=2))
+
+        elif etype == "user":
+            for block in event.get("message", {}).get("content", []):
+                if block.get("type") == "tool_result":
+                    content = block.get("content", "")
+                    if isinstance(content, list):
+                        text = "\n".join(c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text")
+                    elif isinstance(content, str):
+                        text = content
+                    else:
+                        text = str(content)
+                    is_error = block.get("is_error", False)
+                    label = "TOOL RESULT ERROR" if is_error else "TOOL RESULT"
+                    self._write(label, text[:4000])
+
+        elif etype == "result":
+            result_text = event.get("result", "").strip()
+            if result_text and not self.accumulated_text.strip():
+                self.accumulated_text = result_text
+            cost = event.get("total_cost_usd")
+            self._write("RESULT", f"cost=${cost}")
+
+        else:
+            self._f.write(f"[RAW:{etype}] {json.dumps(event)[:500]}\n")
+            self._f.flush()
+
+
+# ---------------------------------------------------------------------------
+# Docker container manager
+# ---------------------------------------------------------------------------
+
+class _ContainerPool:
+    """Manages persistent Docker containers running `opencode serve`."""
+
+    def __init__(self, config_path: Path, permission: dict, docker_image: str, sandbox_prefix: str):
+        self._config_path = config_path
+        self._permission = permission
+        self._image = docker_image
+        self._prefix = sandbox_prefix
+        self._containers: dict[str, dict] = {}
+        self._lock = threading.Lock()
+
+    def get(self, key: str) -> tuple[str, int, str]:
+        """Return (container_name, port, sandbox_dir), creating if needed."""
+        with self._lock:
+            if key in self._containers:
+                info = self._containers[key]
+                check = subprocess.run(
+                    ["docker", "inspect", "-f", "{{.State.Running}}", info["name"]],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if check.returncode == 0 and "true" in check.stdout.lower():
+                    return info["name"], info["port"], info["sandbox_dir"]
+                # Dead container — remove and recreate
+                log.warning("server container %s died, recreating", info["name"])
+                subprocess.run(["docker", "rm", "-f", info["name"]], capture_output=True, timeout=10)
+                del self._containers[key]
+
+            return self._create(key)
+
+    def _create(self, key: str) -> tuple[str, int, str]:
+        sandbox = tempfile.mkdtemp(prefix=self._prefix)
+        os.chmod(sandbox, 0o777)
+        name = f"oc_{uuid.uuid4().hex[:12]}"
+        port = 4096
+
+        shutil.copy2(self._config_path, Path(sandbox) / "opencode.json")
+
+        env_flags: list[str] = []
+        for key_name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY"):
+            val = os.environ.get(key_name)
+            if val:
+                env_flags.extend(["-e", f"{key_name}={val}"])
+
+        cmd = [
+            "docker", "run", "-d",
+            "--name", name,
+            "--read-only",
+            "--user", "1000:1000",
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges:true",
+            "--memory=4g", "--cpus=2",
+            "--pids-limit=128",
+            "--shm-size=8m",
+            "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m,uid=1000,gid=1000",
+            "--tmpfs", "/home/opencode:rw,noexec,nosuid,size=128m,uid=1000,gid=1000",
+            "-v", f"{os.path.realpath(sandbox)}:/workspace:rw",
+            "-e", "OPENCODE_CONFIG=/workspace/opencode.json",
+            "-e", f"OPENCODE_PERMISSION={json.dumps(self._permission)}",
+            *env_flags,
+            self._image,
+            "serve", "--port", str(port), "--hostname", "0.0.0.0",
+        ]
+
+        subprocess.run(cmd, check=True, capture_output=True, timeout=30)
+
+        for _ in range(15):
+            time.sleep(1)
+            logs = subprocess.run(
+                ["docker", "logs", name], capture_output=True, text=True, timeout=15,
+            )
+            if "listening" in logs.stdout or "listening" in logs.stderr:
+                break
+        else:
+            log.warning("server %s may not be ready (timeout)", name)
+
+        self._containers[key] = {"name": name, "port": port, "sandbox_dir": sandbox}
+        log.info("container ready: %s", name)
+        return name, port, sandbox
+
+    def cleanup(self) -> None:
+        with self._lock:
+            for info in self._containers.values():
+                try:
+                    log.info("stopping container: %s", info["name"])
+                    subprocess.run(["docker", "stop", "-t", "3", info["name"]], capture_output=True, timeout=10)
+                    subprocess.run(["docker", "rm", "-f", info["name"]], capture_output=True, timeout=10)
+                except Exception as e:
+                    log.warning("failed to cleanup container %s: %s", info["name"], e)
+                if info.get("sandbox_dir"):
+                    shutil.rmtree(info["sandbox_dir"], ignore_errors=True)
+            self._containers.clear()
+
+
+# ---------------------------------------------------------------------------
+# Analyzer factory
+# ---------------------------------------------------------------------------
 
 def make_opencode_analyzer(
     interval: int = 5,
@@ -130,43 +344,22 @@ def make_opencode_analyzer(
     fast: bool = False,
     resume_session: bool = False,
 ) -> Callable[[Path, int], Optional[str]]:
-    """
-    Returns a hook function that calls OpenCode to analyze the prompt log.
+    """Returns a hook that calls OpenCode to analyze the prompt log.
 
-    Args:
-        interval: Maximum actions between analyzer invocations. 0 = every action.
-        timeout: Max seconds to wait for opencode subprocess.
-        use_subscription: Ignored for OpenCode (always uses ANTHROPIC_API_KEY).
-        allow_bash: If True, allow Bash/Python for board analysis.
-        action_mode: If set, output [ACTIONS] batch plan. "move"/"click"/"all".
-        plan_size: Max actions per batch plan (default: 5).
-        allow_self_read: If True, analyzer can read its own previous output.
-        model: Model name (default: claude-opus-4-6). Auto-prefixed with
-            "anthropic/" if no provider prefix present.
-        fast: Ignored for OpenCode (no equivalent feature).
-        resume_session: If True, reuse OpenCode session across invocations.
-    The returned hook has signature: hook(log_path, action_num) -> hint_str | None
+    The hook signature is: hook(log_path, action_num, retry_nudge="") -> hint | None
     """
-    # --- Verify Docker is available ---
-    if not _HAS_DOCKER:
-        raise FileNotFoundError(
-            "'docker' CLI not found in PATH. Install Docker Desktop to use the OpenCode analyzer."
-        )
+    if not shutil.which("docker"):
+        raise FileNotFoundError("'docker' CLI not found. Install Docker Desktop to use the analyzer.")
     if not _docker_image_exists(_DOCKER_IMAGE):
         raise FileNotFoundError(
-            f"Docker image '{_DOCKER_IMAGE}' not found. Build it with:\n"
+            f"Docker image '{_DOCKER_IMAGE}' not found. Build with:\n"
             f"  cd docker/opencode-sandbox && bash build.sh"
         )
-    log.info(f"[opencode_analyzer] using Docker sandbox: {_DOCKER_IMAGE}")
+    log.info("using Docker sandbox: %s", _DOCKER_IMAGE)
 
-    prompt_template = ANALYSIS_PROMPT
-
-    # Normalize model name to provider/model format
-    # Supports: "anthropic/claude-opus-4-6", "openai/gpt-4o", "openai/o3", etc.
     oc_model = model if "/" in model else f"anthropic/{model}"
-    oc_provider = oc_model.split("/")[0]  # e.g. "anthropic", "openai"
+    oc_provider = oc_model.split("/")[0]
 
-    # --- Build OpenCode config file (once per analyzer instance) ---
     permission: dict = {
         "*": "deny",
         "read": "allow",
@@ -178,7 +371,6 @@ def make_opencode_analyzer(
         } if allow_bash else "deny",
         "external_directory": "deny",
         "doom_loop": "allow",
-        # Deny interactive/write/web tools explicitly
         "question": "deny",
         "edit": "deny",
         "write": "deny",
@@ -195,143 +387,69 @@ def make_opencode_analyzer(
 
     config = {
         "model": oc_model,
-        "provider": {
-            oc_provider: {}
-        },
+        "provider": {oc_provider: {}},
         "permission": permission,
-        "agent": {
-            "build": {
-                "steps": 50,
-            }
-        },
+        "agent": {"build": {"steps": 50}},
     }
 
-    _config_dir = tempfile.mkdtemp(prefix="opencode_analyzer_")
-    _config_path = Path(_config_dir) / "opencode.json"
-    _config_path.write_text(json.dumps(config, indent=2))
-    log.info(f"[opencode_analyzer] config written to {_config_path}")
+    config_dir = tempfile.mkdtemp(prefix="opencode_analyzer_")
+    config_path = Path(config_dir) / "opencode.json"
+    config_path.write_text(json.dumps(config, indent=2))
+    atexit.register(shutil.rmtree, config_dir, True)
 
-    # Clean up temp dir on exit
-    atexit.register(shutil.rmtree, _config_dir, True)
+    pool = _ContainerPool(config_path, permission, _DOCKER_IMAGE, f"oc_sandbox_{uuid.uuid4().hex[:8]}_")
+    atexit.register(pool.cleanup)
 
-    # Unique sandbox prefix per analyzer instance (safe for concurrent runs)
-    _sandbox_prefix = f"oc_sandbox_{uuid.uuid4().hex[:8]}_"
+    session_ids: dict[str, str] = {}
+    session_lock = threading.Lock()
 
-    # Session resume state (thread-safe: one session per log_path)
-    _session_ids: dict[str, str] = {}
-    _session_lock = threading.Lock()
-
-    # --- Persistent Docker server containers (one per game / log_path) ---
-    # Maps log_path_key → {"container_name": str, "port": int, "sandbox_dir": str}
-    _server_containers: dict[str, dict] = {}
-    _server_lock = threading.Lock()
-
-    def _ensure_server(log_path_key: str) -> tuple[str, int, str]:
-        """
-        Start (or reuse) a persistent Docker container running `opencode serve`.
-        Returns (container_name, port, sandbox_dir).
-        The sandbox_dir is the persistent bind-mounted directory for /workspace.
-        """
-        with _server_lock:
-            if log_path_key in _server_containers:
-                info = _server_containers[log_path_key]
-                # Verify container is still running
-                check = subprocess.run(
-                    ["docker", "inspect", "-f", "{{.State.Running}}", info["container_name"]],
-                    capture_output=True, text=True, timeout=5,
+    def _build_prompt(log_name: str, analyzer_log_name: str, analyzer_log_exists: bool,
+                      is_first: bool) -> str:
+        if resume_session and not is_first:
+            prompt = _RESUME_PROMPT.format(log_path=log_name)
+        else:
+            prompt = _INITIAL_PROMPT.format(log_path=log_name)
+            if allow_self_read and analyzer_log_exists:
+                prompt += (
+                    f"\n\nYour previous analysis output is at: {analyzer_log_name}\n"
+                    "Read it to see what you concluded last time and build on it. "
+                    "Avoid repeating strategies that didn't work."
                 )
-                if check.returncode == 0 and "true" in check.stdout.lower():
-                    return info["container_name"], info["port"], info["sandbox_dir"]
-                else:
-                    # Container died — remove entry, will recreate below
-                    log.warning(f"[opencode_analyzer] server container {info['container_name']} died, recreating")
-                    try:
-                        subprocess.run(["docker", "rm", "-f", info["container_name"]],
-                                       capture_output=True, timeout=10)
-                    except Exception:
-                        pass
-                    del _server_containers[log_path_key]
+        if allow_bash:
+            prompt += _PYTHON_ADDENDUM.format(log_path=log_name)
+        if action_mode:
+            prompt += _ACTIONS_ADDENDUM.format(plan_size=plan_size)
+        return prompt
 
-            # Create a persistent sandbox dir for this server container
-            # chmod 777 so container user (1000:1000) can write on Linux
-            sbox_dir = tempfile.mkdtemp(prefix=_sandbox_prefix)
-            os.chmod(sbox_dir, 0o777)
-            container_name = f"oc_{uuid.uuid4().hex[:12]}"
-            port = 4096
-            real_sandbox = os.path.realpath(sbox_dir)
-
-            # Copy config into sandbox so container can read it
-            shutil.copy2(_config_path, Path(sbox_dir) / "opencode.json")
-
-            # Collect API keys
-            env_flags: list[str] = []
-            for key_name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY"):
-                val = os.environ.get(key_name)
-                if val:
-                    env_flags.extend(["-e", f"{key_name}={val}"])
-
-            cmd = [
-                "docker", "run", "-d",
-                "--name", container_name,
-                "--read-only",
-                "--user", "1000:1000",
-                "--cap-drop=ALL",
-                "--security-opt=no-new-privileges:true",
-                "--memory=4g", "--cpus=2",
-                "--pids-limit=128",
-                "--shm-size=8m",
-                "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m,uid=1000,gid=1000",
-                "--tmpfs", "/home/opencode:rw,noexec,nosuid,size=128m,uid=1000,gid=1000",
-                "-v", f"{real_sandbox}:/workspace:rw",
-                "-e", "OPENCODE_CONFIG=/workspace/opencode.json",
-                "-e", f"OPENCODE_PERMISSION={json.dumps(permission)}",
-                *env_flags,
-                _DOCKER_IMAGE,
-                "serve", "--port", str(port), "--hostname", "0.0.0.0",
-            ]
-
-            log.debug(f"[opencode_analyzer] starting server container: {container_name}")
-            subprocess.run(cmd, check=True, capture_output=True, timeout=30)
-
-            # Wait for server to be ready (poll logs for "listening")
-            for _ in range(15):
-                time.sleep(1)
-                logs_result = subprocess.run(
-                    ["docker", "logs", container_name],
-                    capture_output=True, text=True, timeout=15,
-                )
-                if "listening" in logs_result.stdout or "listening" in logs_result.stderr:
-                    break
-            else:
-                log.warning(f"[opencode_analyzer] server {container_name} may not be ready (timeout waiting for 'listening')")
-
-            _server_containers[log_path_key] = {
-                "container_name": container_name,
-                "port": port,
-                "sandbox_dir": sbox_dir,
-            }
-            log.info(f"[opencode_analyzer] container ready: {container_name}")
-            return container_name, port, sbox_dir
-
-    def _cleanup_servers():
-        """Stop and remove all persistent server containers and their sandbox dirs."""
-        with _server_lock:
-            for key, info in list(_server_containers.items()):
-                name = info["container_name"]
-                sbox = info.get("sandbox_dir")
-                try:
-                    log.info(f"[opencode_analyzer] stopping server container: {name}")
-                    subprocess.run(["docker", "stop", "-t", "3", name],
-                                   capture_output=True, timeout=10)
-                    subprocess.run(["docker", "rm", "-f", name],
-                                   capture_output=True, timeout=10)
-                except Exception as e:
-                    log.warning(f"[opencode_analyzer] failed to cleanup container {name}: {e}")
-                if sbox:
-                    shutil.rmtree(sbox, ignore_errors=True)
-            _server_containers.clear()
-
-    atexit.register(_cleanup_servers)
+    def _try_recover_text(container_name: str, sid: str, sandbox_dir: str) -> str:
+        """Attempt to recover analyzer text via session export."""
+        export_path = Path(sandbox_dir) / "_export.json"
+        try:
+            subprocess.run(
+                ["docker", "exec", container_name, "sh", "-c",
+                 f"opencode export {sid} > /workspace/_export.json 2>/dev/null"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if not export_path.exists():
+                return ""
+            data = json.loads(export_path.read_text())
+            recovered = ""
+            for msg in reversed(data.get("messages", [])):
+                role = msg.get("info", {}).get("role")
+                if role == "assistant":
+                    for part in msg.get("parts", []):
+                        if part.get("type") == "text":
+                            candidate = part.get("text", "").strip()
+                            if candidate and "[ACTIONS]" in candidate:
+                                return candidate
+                            if candidate and not recovered:
+                                recovered = candidate
+                    if recovered and "[ACTIONS]" in recovered:
+                        return recovered
+            return recovered
+        except Exception as e:
+            log.debug("export recovery failed: %s", e)
+            return ""
 
     def hook(log_path: Path, action_num: int, retry_nudge: str = "") -> Optional[str]:
         if interval > 0 and action_num % interval != 0:
@@ -340,324 +458,129 @@ def make_opencode_analyzer(
             return None
 
         analyzer_log = log_path.parent / (log_path.stem + "_analyzer.txt")
+        path_key = str(log_path)
 
-        # --- Session resume: detect first-call vs follow-up ---
-        log_path_key = str(log_path)
-        is_first_call = True
-        current_session_id = None
+        is_first = True
+        current_sid = None
         if resume_session:
-            with _session_lock:
-                if log_path_key in _session_ids:
-                    current_session_id = _session_ids[log_path_key]
-                    is_first_call = False
+            with session_lock:
+                if path_key in session_ids:
+                    current_sid = session_ids[path_key]
+                    is_first = False
 
-        # --- Sandbox: reuse the persistent sandbox dir from _ensure_server ---
-        _container_name, _server_port, sandbox_dir = _ensure_server(log_path_key)
+        container_name, server_port, sandbox_dir = pool.get(path_key)
         sandbox = Path(sandbox_dir)
 
         try:
-            # Copy fresh files into sandbox (overwrite for Docker persistent dir)
             shutil.copy2(log_path, sandbox / log_path.name)
-            local_log = log_path.name
-
-            # Copy analyzer log if self-read is enabled and it exists
-            local_analyzer_log = analyzer_log.name
             if allow_self_read and analyzer_log.exists():
                 shutil.copy2(analyzer_log, sandbox / analyzer_log.name)
 
-            # --- Build prompt ---
-            if resume_session and not is_first_call:
-                prompt = _RESUME_FOLLOW_UP_PROMPT.format(log_path=local_log)
-            else:
-                prompt = prompt_template.format(log_path=local_log)
-                if allow_self_read and analyzer_log.exists():
-                    prompt += (
-                        f"\n\nYour previous analysis output is at: {local_analyzer_log}\n"
-                        "Read it to see what you concluded last time and build on it. "
-                        "Avoid repeating strategies that didn't work."
-                    )
-            if allow_bash:
-                prompt += _PYTHON_ADDENDUM.format(log_path=local_log)
-            if action_mode:
-                prompt += _ACTIONS_ADDENDUM.format(plan_size=plan_size)
+            prompt = _build_prompt(log_path.name, analyzer_log.name, analyzer_log.exists(), is_first)
             if retry_nudge:
                 prompt += f"\n\n{retry_nudge}"
 
-            session_label = ""
-            if resume_session and current_session_id:
-                session_label = f" session={current_session_id} ({'new' if is_first_call else 'resume'})"
-
-            # --- Docker sandbox: persistent server + docker exec ---
-            oc_args = ["run", "--attach", f"http://127.0.0.1:{_server_port}"]
-            if resume_session and not is_first_call and current_session_id:
-                oc_args.extend(["--session", current_session_id, "--continue"])
+            # Build opencode command
+            oc_args = ["run", "--attach", f"http://127.0.0.1:{server_port}"]
+            if resume_session and not is_first and current_sid:
+                oc_args.extend(["--session", current_sid, "--continue"])
             oc_args.extend(["--model", oc_model])
             if fast:
                 oc_args.extend(["--variant", "minimal"])
             oc_args.extend(["--format", "json", "--dir", "/workspace"])
             oc_args.append(prompt)
 
-            cmd = ["docker", "exec", _container_name, "opencode", *oc_args]
-            popen_env = None
-            popen_cwd = None
-            log.info(f"[opencode_analyzer] exec {_container_name} model={oc_model}{session_label}")
+            cmd = ["docker", "exec", container_name, "opencode", *oc_args]
+            log.info("exec %s model=%s%s", container_name, oc_model,
+                     f" session={current_sid}" if current_sid else "")
+
             proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-                env=popen_env,
-                cwd=popen_cwd,
+                cmd, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, bufsize=1,
             )
-            log.debug(f"[opencode_analyzer] process started: pid={proc.pid}")
 
-            # Stream-parse stdout line-by-line (nd-JSON), writing to sidecar log
-            accumulated_text = ""
-            session_id_captured = None
+            stderr_lines: list[str] = []
+            def drain_stderr():
+                for line in proc.stderr:
+                    stderr_lines.append(line.rstrip("\n"))
+                    log.debug("STDERR: %s", line[:300].rstrip())
 
-            # Stream stderr in background so we see errors in real-time
-            _stderr_lines: list[str] = []
-
-            def _drain_stderr():
-                for err_line in proc.stderr:
-                    err_line = err_line.rstrip("\n")
-                    _stderr_lines.append(err_line)
-                    log.debug(f"[opencode_analyzer] STDERR: {err_line[:300]}")
-
-            stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+            stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
             stderr_thread.start()
 
             with open(analyzer_log, "a", encoding="utf-8") as f:
                 f.write(f"\n--- action={action_num} | {datetime.now().strftime('%H:%M:%S')} | opencode ---\n")
-                if is_first_call or not resume_session:
+                if is_first or not resume_session:
                     f.write(f"[SYSTEM PROMPT]\n{prompt}\n\n")
                 f.flush()
 
+                parser = _EventStreamParser(f)
                 deadline = time.monotonic() + timeout if timeout is not None else None
 
-                _line_count = 0
                 while True:
                     line = proc.stdout.readline()
                     if not line:
-                        break  # EOF
+                        break
                     if deadline is not None and time.monotonic() > deadline:
-                            proc.kill()
-                            f.write("[TIMEOUT]\n")
-                            f.flush()
-                            log.warning(f"[opencode_analyzer] timed out at action {action_num}")
-                            return None
+                        proc.kill()
+                        f.write("[TIMEOUT]\n")
+                        log.warning("timed out at action %d", action_num)
+                        return None
 
-                    _line_count += 1
                     line = line.rstrip("\n")
                     if not line.strip():
                         continue
                     try:
-                        event = json.loads(line)
-                        etype = event.get("type")
-                        log.debug(f"[opencode_analyzer] event type={etype}")
-
-                        if etype == "step_start":
-                            # Capture session ID for resume
-                            sid = event.get("sessionID")
-                            if sid and not session_id_captured:
-                                session_id_captured = sid
-
-                        elif etype == "text":
-                            text = event.get("part", {}).get("text", "")
-                            if text:
-                                accumulated_text += text
-                                f.write(f"[ASSISTANT]\n{text}\n\n")
-
-                        elif etype == "tool_use":
-                            part = event.get("part", {})
-                            tool_name = part.get("tool", "?")
-                            state = part.get("state", {})
-                            status = state.get("status", "?")
-                            if status in ("running", "completed", "done"):
-                                input_data = state.get("input", {})
-                                input_str = json.dumps(input_data, indent=2) if isinstance(input_data, dict) else str(input_data)
-                                f.write(f"[TOOL CALL: {tool_name}]\n{input_str}\n\n")
-                            if status in ("completed", "done"):
-                                output_data = state.get("output", "")
-                                is_error = state.get("is_error", False) or state.get("error", False)
-                                label = "[TOOL RESULT ERROR]" if is_error else "[TOOL RESULT]"
-                                f.write(f"{label}\n{str(output_data)[:4000]}\n\n")
-
-                        elif etype == "message.part.updated":
-                            # Fallback for alternative event format
-                            part = event.get("part", {})
-                            ptype = part.get("type")
-                            if ptype == "thinking" or ptype == "reasoning":
-                                f.write(f"[THINKING]\n{part.get('text', '')}\n\n")
-                            elif ptype == "tool":
-                                name = part.get("name", "?")
-                                state = part.get("state", "?")
-                                if state == "running":
-                                    input_data = part.get("input", {})
-                                    if isinstance(input_data, dict):
-                                        f.write(f"[TOOL CALL: {name}]\n{json.dumps(input_data, indent=2)}\n\n")
-                                    else:
-                                        f.write(f"[TOOL CALL: {name}]\n{input_data}\n\n")
-                                elif state in ("completed", "done"):
-                                    result_text = part.get("result", part.get("output", ""))
-                                    if isinstance(result_text, str):
-                                        text = result_text
-                                    else:
-                                        text = str(result_text)
-                                    is_error = part.get("is_error", False) or part.get("error", False)
-                                    label = "[TOOL RESULT ERROR]" if is_error else "[TOOL RESULT]"
-                                    f.write(f"{label}\n{text[:4000]}\n\n")
-
-                        elif etype == "error":
-                            err = event.get("error", {})
-                            err_name = err.get("name", "UnknownError")
-                            err_data = err.get("data", {})
-                            err_msg = err_data.get("message", str(err))
-                            f.write(f"[ERROR: {err_name}]\n{err_msg}\n\n")
-                            log.error(f"[opencode_analyzer] API error: {err_name}: {err_msg}")
-
-                            # Context overflow → kill session so next call starts fresh
-                            if "overflow" in err_name.lower() or "too long" in err_msg.lower():
-                                log.warning(
-                                    f"[opencode_analyzer] context overflow at action {action_num} "
-                                    f"— clearing session ID to force fresh start"
-                                )
-                                with _session_lock:
-                                    _session_ids.pop(log_path_key, None)
-                                session_id_captured = None
-
-                        elif etype == "step_finish":
-                            part = event.get("part", {})
-                            cost = part.get("cost")
-                            f.write(f"[RESULT] cost=${cost}\n\n")
-
-                        # --- Fallback: Claude-style events (in case OpenCode
-                        #     mirrors Claude's format for some providers) ---
-                        elif etype == "assistant":
-                            for block in event.get("message", {}).get("content", []):
-                                if block.get("type") == "thinking":
-                                    f.write(f"[THINKING]\n{block.get('thinking', '')}\n\n")
-                                elif block.get("type") == "text":
-                                    text = block["text"]
-                                    accumulated_text += text
-                                    f.write(f"[ASSISTANT]\n{text}\n\n")
-                                elif block.get("type") == "tool_use":
-                                    f.write(f"[TOOL CALL: {block['name']}]\n{json.dumps(block.get('input', {}), indent=2)}\n\n")
-                        elif etype == "user":
-                            msg = event.get("message", {})
-                            for block in msg.get("content", []):
-                                if block.get("type") == "tool_result":
-                                    content = block.get("content", "")
-                                    if isinstance(content, str):
-                                        text = content
-                                    elif isinstance(content, list):
-                                        text = "\n".join(
-                                            c.get("text", "") for c in content
-                                            if isinstance(c, dict) and c.get("type") == "text"
-                                        )
-                                    else:
-                                        text = str(content)
-                                    is_error = block.get("is_error", False)
-                                    label = "[TOOL RESULT ERROR]" if is_error else "[TOOL RESULT]"
-                                    f.write(f"{label}\n{text[:4000]}\n\n")
-                        elif etype == "result":
-                            # Use result text only as fallback — text events are the
-                            # primary source across multi-step agent runs
-                            result_text = event.get("result", "").strip()
-                            if result_text and not accumulated_text.strip():
-                                accumulated_text = result_text
-                            cost = event.get("total_cost_usd")
-                            f.write(f"[RESULT] cost=${cost}\n\n")
-
-                        else:
-                            # Unknown event type — log raw for debugging
-                            f.write(f"[RAW:{etype}] {line[:500]}\n")
-
-                        f.flush()
+                        parser.handle(json.loads(line))
                     except json.JSONDecodeError:
                         f.write(f"[RAW] {line}\n")
                         f.flush()
 
-                returncode = proc.wait()
+                proc.wait()
                 stderr_thread.join(timeout=5)
-                stderr_text = "\n".join(_stderr_lines)
-                if stderr_text:
-                    f.write(f"\n--- STDERR ---\n{stderr_text}\n")
+                if stderr_lines:
+                    f.write(f"\n--- STDERR ---\n{''.join(l + chr(10) for l in stderr_lines)}")
                     f.flush()
 
-                # Fallback: export session to recover text lost to race condition.
-                # Fires when: (1) no text at all, or (2) text exists but lacks [ACTIONS]
-                _needs_recovery = (
-                    not accumulated_text.strip()
-                    or (action_mode and "[ACTIONS]" not in accumulated_text)
+                # Recovery: if no text or missing [ACTIONS], try session export
+                needs_recovery = (
+                    not parser.accumulated_text.strip()
+                    or (action_mode and "[ACTIONS]" not in parser.accumulated_text)
                 )
-                if _needs_recovery and session_id_captured:
-                    try:
-                        _export_container_path = "/workspace/_export.json"
-                        _export_host_path = Path(sandbox_dir) / "_export.json"
-                        _export = subprocess.run(
-                            ["docker", "exec", _container_name, "sh", "-c",
-                             f"opencode export {session_id_captured} > {_export_container_path} 2>/dev/null"],
-                            capture_output=True, text=True, timeout=30,
-                        )
-                        if _export.returncode == 0 and _export_host_path.exists():
-                            _export_data = json.loads(_export_host_path.read_text())
-                            _msgs = _export_data.get("messages", [])
-                            _recovered_text = ""
-                            for _msg in reversed(_msgs):
-                                _role = _msg.get("info", {}).get("role")
-                                if _role == "assistant":
-                                    for _part in _msg.get("parts", []):
-                                        if _part.get("type") == "text":
-                                            _candidate = _part.get("text", "").strip()
-                                            if _candidate and "[ACTIONS]" in _candidate:
-                                                _recovered_text = _candidate
-                                                break
-                                            elif _candidate and not _recovered_text:
-                                                _recovered_text = _candidate
-                                    if _recovered_text and "[ACTIONS]" in _recovered_text:
-                                        break
-                            if _recovered_text:
-                                accumulated_text = _recovered_text
-                                log.info(f"[opencode_analyzer] recovered {len(_recovered_text)} chars via session export")
-                        else:
-                            log.debug(f"[opencode_analyzer] export recovery: export failed rc={_export.returncode}")
-                    except json.JSONDecodeError as _je:
-                        log.debug(f"[opencode_analyzer] export recovery: JSON parse error: {_je}")
-                    except Exception as _e:
-                        log.debug(f"[opencode_analyzer] export recovery failed: {_e}")
+                if needs_recovery and parser.session_id:
+                    recovered = _try_recover_text(container_name, parser.session_id, sandbox_dir)
+                    if recovered:
+                        parser.accumulated_text = recovered
+                        log.info("recovered %d chars via session export", len(recovered))
+
+                # Handle context overflow — parser clears session_id on overflow errors
+                if resume_session and parser.session_id is None and not is_first:
+                    log.warning("context overflow — clearing session for %s", path_key)
+                    with session_lock:
+                        session_ids.pop(path_key, None)
 
                 f.flush()
 
-            hint = accumulated_text.strip() if accumulated_text.strip() else None
+            hint = parser.accumulated_text.strip() or None
 
-            if returncode != 0 or not hint:
-                log.warning(
-                    f"[opencode_analyzer] action={action_num} failed: "
-                    f"rc={returncode}, hint_len={len(hint) if hint else 0}"
-                )
-                # Clear session on any failure so next call starts fresh
+            if proc.returncode != 0 or not hint:
+                log.warning("action=%d failed: rc=%d, hint_len=%d",
+                            action_num, proc.returncode, len(hint) if hint else 0)
                 if resume_session:
-                    log.warning(
-                        f"[opencode_analyzer] clearing session for "
-                        f"{log_path_key} (was {'resume' if not is_first_call else 'fresh'})"
-                    )
-                    with _session_lock:
-                        _session_ids.pop(log_path_key, None)
+                    with session_lock:
+                        session_ids.pop(path_key, None)
                 return None
 
-            # Store session ID for resume only after confirmed success
-            if resume_session and session_id_captured:
-                with _session_lock:
-                    _session_ids[log_path_key] = session_id_captured
+            if resume_session and parser.session_id:
+                with session_lock:
+                    session_ids[path_key] = parser.session_id
 
-            log.info(f"[opencode_analyzer] action={action_num} OK ({len(hint)} chars)")
+            log.info("action=%d OK (%d chars)", action_num, len(hint))
             return hint
 
         except Exception as e:
-            log.error(f"[opencode_analyzer] unexpected error: {e}", exc_info=True)
+            log.error("unexpected error: %s", e, exc_info=True)
             return None
 
     return hook
