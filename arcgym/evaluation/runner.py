@@ -1,7 +1,4 @@
-"""GameRunner — orchestrator that drives the agent through a game loop.
-
-The Swarm creates one per game thread and calls runner.run().
-"""
+"""Game loop that drives an RGBAgent through an ARC-AGI-3 environment."""
 import asyncio
 import logging
 import os
@@ -48,11 +45,7 @@ def _run_with_retries(func: Callable, *args: Any, **kwargs: Any) -> Any:
 
 
 class GameRunner:
-    """Drives the RGBAgent through a game loop.
-
-    Not an agent — owns the env interaction loop,
-    manages the analyzer, and collects metrics.
-    """
+    """Runs an RGBAgent through a game, collecting metrics."""
 
     def __init__(
         self,
@@ -273,7 +266,6 @@ class GameRunner:
 
         return metrics
 
-    # -- private helpers -------------------------------------------------------
 
     def _fire_analyzer(self, action_num: int, arc_score: int, retry_nudge: str = "") -> bool:
         if not self.analyzer:

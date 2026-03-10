@@ -1,4 +1,4 @@
-"""Base ARC agent with rolling context, state-action memory, and hint injection."""
+"""Base agent class for ARC-AGI-3."""
 from __future__ import annotations
 
 import logging
@@ -18,10 +18,7 @@ log = logging.getLogger(__name__)
 
 
 class BaseArcAgent(BaseAgent):
-    """Two-phase agent (observation then action) with rolling context window.
-
-    Subclasses override _call_observation_model and _call_action_model.
-    """
+    """Two-phase agent (observation then action) with rolling context window."""
 
     def __init__(
         self,
@@ -42,7 +39,6 @@ class BaseArcAgent(BaseAgent):
         self._state_action_memory: dict[str, dict[str, dict[str, Any]]] = {}
         self.reset()
 
-    # -- lifecycle -------------------------------------------------------------
 
     def reset(self) -> None:
         self._trajectory = Trajectory(name=self.name)
@@ -64,7 +60,6 @@ class BaseArcAgent(BaseAgent):
     def trajectory(self) -> Trajectory:
         return self._trajectory
 
-    # -- hints (called by harness / analyzer) ----------------------------------
 
     def set_external_hint(self, hint: str) -> None:
         """One-shot strategic hint for the next observation prompt."""
@@ -75,7 +70,6 @@ class BaseArcAgent(BaseAgent):
         """Short plan that persists on every prompt until the next analysis."""
         self._persistent_hint = plan
 
-    # -- grid helpers ----------------------------------------------------------
 
     def _format_grid(self, grid: list[list[int]]) -> str:
         return format_grid_ascii(grid)
@@ -85,7 +79,6 @@ class BaseArcAgent(BaseAgent):
         grid_raw = [list(row) for row in frame_3d[-1]] if frame_3d else []
         return grid_raw, self._format_grid(grid_raw) if grid_raw else ""
 
-    # -- state-action memory ---------------------------------------------------
 
     def _record_state_action(self, state_hash: str, action_key: str, result: dict[str, Any]) -> None:
         self._state_action_memory.setdefault(state_hash, {})[action_key] = result
@@ -110,7 +103,6 @@ class BaseArcAgent(BaseAgent):
         lines.append("")
         return "\n".join(lines)
 
-    # -- step history ----------------------------------------------------------
 
     def _format_step_history(self, include_strategy: bool = True) -> str:
         if not self._step_history:
@@ -132,7 +124,6 @@ class BaseArcAgent(BaseAgent):
             lines.append(text)
         return "\n".join(lines) + "\n"
 
-    # -- core loop -------------------------------------------------------------
 
     def update_from_env(self, observation: Any, reward: float, done: bool, info: dict = None, **_: Any) -> None:
         self._last_observation = observation

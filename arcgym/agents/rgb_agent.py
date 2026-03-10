@@ -1,8 +1,4 @@
-"""RGBAgent — the actual agent that thinks and acts.
-
-Merges the analyzer (LLM calls via OpenCode in Docker) with the action queue.
-The GameRunner drives this agent through the game loop.
-"""
+"""RGBAgent and analyzer (make_analyzer) for ARC-AGI-3."""
 from __future__ import annotations
 
 import atexit
@@ -30,15 +26,11 @@ class QueueExhausted(RuntimeError):
     pass
 
 
-# ---------------------------------------------------------------------------
-# ActionQueue
-# ---------------------------------------------------------------------------
-
 _VALID_ACTIONS = {"ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5", "ACTION6", "RESET"}
 
 
 class ActionQueue:
-    """Parses analyzer [ACTIONS] JSON and serves actions one at a time."""
+    """Holds and serves a batch of parsed actions."""
 
     def __init__(self) -> None:
         self._queue: deque[dict] = deque()
@@ -120,12 +112,8 @@ class ActionQueue:
         return True
 
 
-# ---------------------------------------------------------------------------
-# RGBAgent
-# ---------------------------------------------------------------------------
-
 class RGBAgent(BaseArcAgent):
-    """The actual agent: manages an action queue, driven by an external analyzer."""
+    """Queue-based agent for ARC-AGI-3 puzzles."""
 
     def __init__(self, *, plan_size: int = 5, **kwargs: Any) -> None:
         self._queue = ActionQueue()
@@ -161,8 +149,6 @@ class RGBAgent(BaseArcAgent):
     def set_action_plan(self, actions_text: str) -> bool:
         return self._queue.load(actions_text)
 
-    # -- flush queue on score change (level transition) ------------------------
-
     def update_from_env(self, observation, reward, done, info=None):
         super().update_from_env(observation, reward, done, info)
         obs = observation if isinstance(observation, dict) else {}
@@ -174,8 +160,6 @@ class RGBAgent(BaseArcAgent):
                 self._queue.clear()
             self._score_changed = True
             self._last_score = score
-
-    # -- main loop -------------------------------------------------------------
 
     async def call_llm(self):
         self._use_queued = bool(self._queue and not self._score_changed)
@@ -236,10 +220,6 @@ class RGBAgent(BaseArcAgent):
         log.info("queue empty — ending episode")
         raise QueueExhausted("Queue empty, no actions from analyzer")
 
-
-# ---------------------------------------------------------------------------
-# Analyzer infrastructure (OpenCode in Docker)
-# ---------------------------------------------------------------------------
 
 _INITIAL_PROMPT = """\
 You are a strategic advisor for an AI agent playing a grid-based puzzle game.
@@ -533,10 +513,6 @@ class _ContainerPool:
                     shutil.rmtree(info["sandbox_dir"], ignore_errors=True)
             self._containers.clear()
 
-
-# ---------------------------------------------------------------------------
-# Analyzer factory
-# ---------------------------------------------------------------------------
 
 def make_analyzer(
     interval: int = 5,
