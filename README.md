@@ -15,8 +15,7 @@ git clone git@github.com:alexisfox7/RGB-Agent.git
 cd RGB-Agent
 python -m venv .venv
 source .venv/bin/activate
-uv sync
-cd docker/opencode-sandbox && bash build.sh   # build analyzer sandbox image
+make install
 ```
 
 Create a `.env` file:
@@ -31,6 +30,8 @@ LOCAL_ANALYZER_MODEL_ID=qwen3.5-0.8b
 ## Usage
 
 ```bash
+make run
+make run MODEL=opus
 rgb-swarm --suite all --max-actions 500
 rgb-swarm --game ls20,ft09
 rgb-swarm --env-source re_arc --game memory-0001 --max-actions 200
