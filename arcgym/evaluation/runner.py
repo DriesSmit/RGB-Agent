@@ -1,4 +1,4 @@
-"""Game loop that drives an RGBAgent through an ARC-AGI-3 environment."""
+"""Game loop that drives an RGBAgent through a compatible ARC environment."""
 import asyncio
 import logging
 import os
@@ -10,7 +10,7 @@ from typing import Any, Callable, Optional
 import requests
 
 from arcgym.agents.rgb_agent import RGBAgent, QueueExhausted
-from arcgym.environments import ArcAgi3Env
+from arcgym.core import BaseEnv
 from arcengine import GameState
 from arcgym.metrics.structures import GameMetrics, LevelMetrics, AttemptMetrics, Status
 
@@ -50,7 +50,7 @@ class GameRunner:
     def __init__(
         self,
         *,
-        env: ArcAgi3Env,
+        env: BaseEnv,
         game_id: str,
         agent_name: str,
         max_actions_per_game: int,

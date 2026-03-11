@@ -31,6 +31,7 @@ ANTHROPIC_API_KEY=...
 ```bash
 arcgym-swarm --suite all --max-actions 500
 arcgym-swarm --game ls20,ft09
+arcgym-swarm --env-source re_arc --game taps --max-actions 200
 ```
 
 ### Key flags
@@ -40,6 +41,7 @@ arcgym-swarm --game ls20,ft09
 | `--suite` | — | Predefined game suites (e.g. `ls20`, `vc33`, `ft09`, or `all`) |
 | `--game` | — | Comma-separated game names or IDs (alternative to `--suite`) |
 | `--max-actions` | 500 | Max actions per game |
+| `--env-source` | `arc_agi` | Environment backend: `arc_agi` (online/offline ARC API) or `re_arc` (local games like `taps`) |
 | `--analyzer-interval` | 10 | Actions per analyzer batch plan |
 | `--analyzer-model` | `claude-opus-4-6` | Analyzer model (see below) |
 | `--operation-mode` | `online` | `online` / `offline` / `normal` |
@@ -74,4 +76,3 @@ arcgym/evaluation/
 ├── swarm.py       # CLI entry point
 ├── runner.py      # Per-game episode loop
 ```
-
