@@ -46,6 +46,7 @@ _RE_ARC_GAME_ALIASES = {
     "memory": "simon_tiles-0001",
     "memory-0001": "simon_tiles-0001",
 }
+_DEFAULT_ANALYZER_MODEL = os.environ.get("ARCGYM_ANALYZER_MODEL", "local-qwen")
 
 
 class Swarm:
@@ -248,7 +249,12 @@ def main() -> None:
     parser.add_argument("--re-arc-augment", dest="re_arc_augment", action="store_true")
     parser.add_argument("--re-arc-environments-dir", dest="re_arc_environments_dir", default=None)
     parser.add_argument("--analyzer-interval", dest="analyzer_interval", type=int, default=10)
-    parser.add_argument("--analyzer-model", dest="analyzer_model", default="claude-opus-4-6")
+    parser.add_argument(
+        "--analyzer-model",
+        dest="analyzer_model",
+        default=_DEFAULT_ANALYZER_MODEL,
+        help="Analyzer model or alias (default: %(default)s). Useful aliases: local-qwen, opus, sonnet.",
+    )
     parser.add_argument("--analyzer-retries", dest="analyzer_retries", type=int, default=5)
 
     args = parser.parse_args()

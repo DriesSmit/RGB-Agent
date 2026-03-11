@@ -24,6 +24,8 @@ Create a `.env` file:
 ```
 ARC_API_KEY=...
 ANTHROPIC_API_KEY=...
+LOCAL_ANALYZER_BASE_URL=http://host.docker.internal:1234/v1
+LOCAL_ANALYZER_MODEL_ID=qwen3.5-0.8b
 ```
 
 ## Usage
@@ -32,6 +34,7 @@ ANTHROPIC_API_KEY=...
 arcgym-swarm --suite all --max-actions 500
 arcgym-swarm --game ls20,ft09
 arcgym-swarm --env-source re_arc --game taps --max-actions 200
+arcgym-swarm --env-source re_arc --game memory-0001 --analyzer-model opus
 ```
 
 ### Key flags
@@ -43,23 +46,26 @@ arcgym-swarm --env-source re_arc --game taps --max-actions 200
 | `--max-actions` | 500 | Max actions per game |
 | `--env-source` | `arc_agi` | Environment backend: `arc_agi` (online/offline ARC API) or `re_arc` (local games like `taps`) |
 | `--analyzer-interval` | 10 | Actions per analyzer batch plan |
-| `--analyzer-model` | `claude-opus-4-6` | Analyzer model (see below) |
+| `--analyzer-model` | `local-qwen` | Analyzer model or alias (see below) |
 | `--operation-mode` | `online` | `online` / `offline` / `normal` |
 
 ### Analyzer models
 
-Anthropic models can be passed without a prefix. For other providers, use `provider/model`.
+The default analyzer preset is `local-qwen`, which expects a local OpenAI-compatible endpoint reachable from the Docker sandbox. Anthropic models can still be passed without a prefix. For other providers, use `provider/model`.
 
 | Model | `--analyzer-model` value |
 |-------|--------------------------|
-| Claude Opus 4.6 | `claude-opus-4-6` (default) |
+| Local Qwen 3.5 0.8B | `local-qwen` (default) |
+| Claude Opus 4.6 | `opus` or `claude-opus-4-6` |
 | Claude Sonnet 4.6 | `claude-sonnet-4-6` |
 | GPT 5.2 | `openai/gpt-5.2` |
 | Gemini 2.5 Pro | `google/gemini-2.5-pro` |
 
 Any model available via OpenRouter can also be used with the `openrouter/` prefix (e.g. `openrouter/google/gemini-3.1-pro-preview`).
 
-Set the matching API key in `.env` (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, or `OPENROUTER_API_KEY`).
+Set the matching API key in `.env` (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, or `OPENROUTER_API_KEY`). For the local preset, set `LOCAL_ANALYZER_BASE_URL` and `LOCAL_ANALYZER_MODEL_ID`; if your local server requires auth, also set `LOCAL_ANALYZER_API_KEY`.
+
+The analyzer runs inside Docker. On Linux, your local model server usually needs to listen on a non-loopback interface so `host.docker.internal` can reach it from the sandbox.
 
 Results are saved to `evaluation_results/`.
 
