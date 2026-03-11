@@ -73,3 +73,12 @@ PYTHON_ADDENDUM = (
     "```\n"
     "Run Python inline."
 )
+
+SMALL_MODEL_ADDENDUM = """
+
+Extra guidance for a small local model:
+- Keep the strategic briefing short and concrete.
+- Focus on the current board and the next experiment, not the full history.
+- Prefer 1-3 decisive actions over long speculative plans.
+- Avoid filler and repetition; spend tokens on coordinates and state changes.
+"""

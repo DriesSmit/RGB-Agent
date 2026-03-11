@@ -19,5 +19,6 @@ class BaseEnv(ABC):
 
 
 from rgb_agent.environment.arcagi3 import ArcAgi3Env
+from rgb_agent.environment.rearc import ReArcEnv
 
-__all__ = ["BaseEnv", "ArcAgi3Env"]
+__all__ = ["BaseEnv", "ArcAgi3Env", "ReArcEnv"]

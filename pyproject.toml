@@ -14,6 +14,7 @@ requires-python = ">=3.12"
 keywords = ["arc-agi", "agent", "puzzle-solving"]
 dependencies = [
     "arc-agi>=0.9.1",
+    "arc-agi-3-local @ git+ssh://git@github.com/Tufalabs/re-arc-3.git?branch=main",
     "arcengine>=0.9.3",
     "hydra-core>=1.3",
     "pydantic>=2.5",
@@ -34,6 +35,7 @@ dev = [
 
 [project.scripts]
 rgb-swarm = "rgb_agent.environment.swarm:main"
+arcgym-swarm = "rgb_agent.environment.swarm:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

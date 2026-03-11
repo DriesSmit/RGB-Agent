@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from collections import deque
 
 log = logging.getLogger(__name__)
+
+_LOG_REASONING_MAX_CHARS = int(os.environ.get("ARCGYM_REASONING_LOG_CHARS", "0"))
 
 
 class QueueExhausted(RuntimeError):
@@ -14,6 +17,13 @@ class QueueExhausted(RuntimeError):
 
 
 _VALID_ACTIONS = {"ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5", "ACTION6", "RESET"}
+
+
+def _truncate_log_text(text: object, limit: int) -> str:
+    value = " ".join(str(text).split())
+    if limit <= 0 or len(value) <= limit:
+        return value
+    return value[: max(0, limit - 3)].rstrip() + "..."
 
 
 class ActionQueue:
@@ -112,5 +122,5 @@ class ActionQueue:
         log.info("loaded %d-step plan: %s — %s",
                  self.plan_total,
                  [s if isinstance(s, str) else s.get("action") for s in plan],
-                 reasoning[:100])
+                 _truncate_log_text(reasoning, _LOG_REASONING_MAX_CHARS))
         return True

@@ -30,3 +30,5 @@ outputs/
 # Claude Code
 .claude/
 
+# UV
+uv.lock

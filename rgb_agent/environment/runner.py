@@ -10,7 +10,7 @@ from typing import Any, Callable, Optional
 import requests
 
 from rgb_agent.agent import GameState, ActionQueue, QueueExhausted
-from rgb_agent.environment import ArcAgi3Env
+from rgb_agent.environment import BaseEnv
 from arcengine import GameState as ArcGameState
 from rgb_agent.metrics.structures import GameMetrics, LevelMetrics, AttemptMetrics, Status
 
@@ -50,7 +50,7 @@ class GameRunner:
     def __init__(
         self,
         *,
-        env: ArcAgi3Env,
+        env: BaseEnv,
         game_id: str,
         agent_name: str,
         max_actions_per_game: int,

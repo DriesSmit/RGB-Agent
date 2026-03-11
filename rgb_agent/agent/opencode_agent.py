@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import IO, Literal, Optional
@@ -20,11 +21,98 @@ from rgb_agent.agent.prompts import (
     RESUME_PROMPT,
     ACTIONS_ADDENDUM,
     PYTHON_ADDENDUM,
+    SMALL_MODEL_ADDENDUM,
 )
 
 log = logging.getLogger(__name__)
 
 _DOCKER_IMAGE = os.environ.get("OPENCODE_DOCKER_IMAGE", "rgb-agent/opencode-sandbox:latest")
+_LOCAL_ANALYZER_PROVIDER = os.environ.get("LOCAL_ANALYZER_PROVIDER", "local")
+_LOCAL_ANALYZER_MODEL_ID = os.environ.get("LOCAL_ANALYZER_MODEL_ID", "qwen3.5-0.8b")
+_LOCAL_ANALYZER_BASE_URL = os.environ.get("LOCAL_ANALYZER_BASE_URL", "http://host.docker.internal:1234/v1")
+_LOCAL_ANALYZER_DISPLAY_NAME = os.environ.get("LOCAL_ANALYZER_DISPLAY_NAME", "Local Qwen 3.5 0.8B")
+_DEFAULT_ANALYZER_MODEL = os.environ.get("RGB_ANALYZER_MODEL", os.environ.get("ARCGYM_ANALYZER_MODEL", "local-qwen"))
+
+
+def _get_env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+_LOCAL_ANALYZER_CONTEXT_WINDOW = _get_env_int("LOCAL_ANALYZER_CONTEXT_WINDOW", 32768)
+_LOCAL_ANALYZER_MAX_OUTPUT = _get_env_int("LOCAL_ANALYZER_MAX_OUTPUT", 2048)
+
+
+@dataclass(frozen=True)
+class _AnalyzerModelSpec:
+    oc_model: str
+    provider_config: dict[str, dict]
+    compact_prompt: bool = False
+    fast_by_default: bool = False
+
+
+def _resolve_analyzer_model(model: str) -> _AnalyzerModelSpec:
+    requested = (model or "").strip()
+    lowered = requested.lower()
+
+    if lowered in {"local", "local-qwen", "qwen-local", "qwen"}:
+        model_id = os.environ.get("LOCAL_ANALYZER_MODEL_ID", _LOCAL_ANALYZER_MODEL_ID).strip()
+        if not model_id:
+            raise ValueError("LOCAL_ANALYZER_MODEL_ID must be set for the local analyzer preset.")
+
+        provider_id = os.environ.get("LOCAL_ANALYZER_PROVIDER", _LOCAL_ANALYZER_PROVIDER).strip() or "local"
+        base_url = os.environ.get("LOCAL_ANALYZER_BASE_URL", _LOCAL_ANALYZER_BASE_URL).strip()
+        if not base_url:
+            raise ValueError("LOCAL_ANALYZER_BASE_URL must be set for the local analyzer preset.")
+
+        provider_options: dict[str, str] = {"baseURL": base_url}
+        if os.environ.get("LOCAL_ANALYZER_API_KEY"):
+            provider_options["apiKey"] = "{env:LOCAL_ANALYZER_API_KEY}"
+
+        model_options: dict[str, int] = {}
+        if _LOCAL_ANALYZER_CONTEXT_WINDOW > 0:
+            model_options["contextWindow"] = _LOCAL_ANALYZER_CONTEXT_WINDOW
+        if _LOCAL_ANALYZER_MAX_OUTPUT > 0:
+            model_options["maxOutput"] = _LOCAL_ANALYZER_MAX_OUTPUT
+
+        provider_config = {
+            provider_id: {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": os.environ.get("LOCAL_ANALYZER_PROVIDER_NAME", "Local OpenAI-Compatible"),
+                "options": provider_options,
+                "models": {
+                    model_id: {
+                        "name": os.environ.get("LOCAL_ANALYZER_DISPLAY_NAME", _LOCAL_ANALYZER_DISPLAY_NAME),
+                        "options": model_options,
+                    },
+                },
+            },
+        }
+        return _AnalyzerModelSpec(
+            oc_model=f"{provider_id}/{model_id}",
+            provider_config=provider_config,
+            compact_prompt=True,
+            fast_by_default=True,
+        )
+
+    if lowered == "opus":
+        requested = "claude-opus-4-6"
+    elif lowered == "sonnet":
+        requested = "claude-sonnet-4-6"
+
+    oc_model = requested if "/" in requested else f"anthropic/{requested}"
+    provider_id = oc_model.split("/", 1)[0]
+    return _AnalyzerModelSpec(
+        oc_model=oc_model,
+        provider_config={provider_id: {}},
+        compact_prompt=False,
+        fast_by_default=False,
+    )
 
 
 def _docker_image_exists(image: str) -> bool:
@@ -188,7 +276,13 @@ class _ContainerPool:
         shutil.copy2(self._config_path, Path(sandbox) / "opencode.json")
 
         env_flags: list[str] = []
-        for key_name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY"):
+        for key_name in (
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GOOGLE_API_KEY",
+            "OPENROUTER_API_KEY",
+            "LOCAL_ANALYZER_API_KEY",
+        ):
             val = os.environ.get(key_name)
             if val:
                 env_flags.extend(["-e", f"{key_name}={val}"])
@@ -205,6 +299,7 @@ class _ContainerPool:
             "--shm-size=8m",
             "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m,uid=1000,gid=1000",
             "--tmpfs", "/home/opencode:rw,noexec,nosuid,size=128m,uid=1000,gid=1000",
+            "--add-host", "host.docker.internal:host-gateway",
             "-v", f"{os.path.realpath(sandbox)}:/workspace:rw",
             "-e", "OPENCODE_CONFIG=/workspace/opencode.json",
             "-e", f"OPENCODE_PERMISSION={json.dumps(self._permission)}",
@@ -249,7 +344,7 @@ class OpenCodeAgent:
     def __init__(
         self,
         *,
-        model: str = "claude-opus-4-6",
+        model: str = _DEFAULT_ANALYZER_MODEL,
         interval: int = 0,
         timeout: Optional[int] = None,
         allow_bash: bool = True,
@@ -268,7 +363,8 @@ class OpenCodeAgent:
             )
         log.info("using Docker sandbox: %s", _DOCKER_IMAGE)
 
-        self._oc_model = model if "/" in model else f"anthropic/{model}"
+        self._model_spec = _resolve_analyzer_model(model)
+        self._oc_model = self._model_spec.oc_model
         self._interval = interval
         self._timeout = timeout
         self._allow_bash = allow_bash
@@ -277,8 +373,6 @@ class OpenCodeAgent:
         self._allow_self_read = allow_self_read
         self._fast = fast
         self._resume_session = resume_session
-
-        oc_provider = self._oc_model.split("/")[0]
 
         permission: dict = {
             "*": "deny",
@@ -307,7 +401,7 @@ class OpenCodeAgent:
 
         config = {
             "model": self._oc_model,
-            "provider": {oc_provider: {}},
+            "provider": self._model_spec.provider_config,
             "permission": permission,
             "agent": {"build": {"steps": 50}},
         }
@@ -337,6 +431,8 @@ class OpenCodeAgent:
                 )
         if self._allow_bash:
             prompt += PYTHON_ADDENDUM.format(log_path=log_name)
+        if self._model_spec.compact_prompt:
+            prompt += SMALL_MODEL_ADDENDUM
         if self._action_mode:
             prompt += ACTIONS_ADDENDUM.format(plan_size=self._plan_size)
         return prompt
@@ -404,7 +500,7 @@ class OpenCodeAgent:
             if self._resume_session and not is_first and current_sid:
                 oc_args.extend(["--session", current_sid, "--continue"])
             oc_args.extend(["--model", self._oc_model])
-            if self._fast:
+            if self._fast or self._model_spec.fast_by_default:
                 oc_args.extend(["--variant", "minimal"])
             oc_args.extend(["--format", "json", "--dir", "/workspace"])
             oc_args.append(prompt)
