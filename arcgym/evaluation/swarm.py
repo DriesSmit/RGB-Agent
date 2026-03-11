@@ -194,7 +194,7 @@ def main() -> None:
         operation_mode=OperationMode(args.operation_mode),
     )
 
-    from arcgym.agents.rgb_agent import make_analyzer
+    from arcgym.agents.planner import make_analyzer
 
     analyzer_hook = make_analyzer(
         interval=0, use_subscription=False, allow_bash=True,

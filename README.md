@@ -61,3 +61,17 @@ Set the matching API key in `.env` (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOG
 
 Results are saved to `evaluation_results/`.
 
+## Architecture
+
+Every N actions, the planner (a coding agent ([OpenCode](https://github.com/opencode-ai/opencode))) running in a sandboxed Docker container reads the agent's prompt log with Read, Grep, and Python, then outputs a JSON action plan. The agent queues these actions and drains them one per step with zero LLM calls. When the queue empties or the score changes, the planner re-fires.
+
+```
+arcgym/agents/
+├── rgb_agent.py   # Agent + action queue
+├── planner.py     # OpenCode-in-Docker planner
+├── prompts.py     # Planner prompt templates
+arcgym/evaluation/
+├── swarm.py       # CLI entry point
+├── runner.py      # Per-game episode loop
+```
+
