@@ -475,14 +475,23 @@ class OpenCodeAgent:
             log.debug("export recovery failed: %s", e)
             return ""
 
-    def analyze(self, log_path: Path, action_num: int, retry_nudge: str = "") -> Optional[str]:
+    def analyze(
+        self,
+        log_path: Path,
+        action_num: int,
+        transcript_path: Path | None = None,
+        analysis_step: int | None = None,
+        retry_nudge: str = "",
+        retry_attempt: int | None = None,
+        retry_total: int | None = None,
+    ) -> Optional[str]:
         """Analyze the game log and return the agent's response text, or None on failure."""
         if self._interval > 0 and action_num % self._interval != 0:
             return None
         if not log_path.exists():
             return None
 
-        analyzer_log = log_path.parent / (log_path.stem + "_analyzer.txt")
+        analyzer_log = transcript_path or (log_path.parent / (log_path.stem + "_analyzer.txt"))
         path_key = str(log_path)
 
         is_first = True
@@ -534,9 +543,17 @@ class OpenCodeAgent:
             stderr_thread.start()
 
             with open(analyzer_log, "a", encoding="utf-8") as f:
-                f.write(f"\n--- action={action_num} | {datetime.now().strftime('%H:%M:%S')} | opencode ---\n")
-                if is_first or not self._resume_session:
-                    f.write(f"[SYSTEM PROMPT]\n{prompt}\n\n")
+                step_label = f"analysis_step={analysis_step} | " if analysis_step is not None else ""
+                retry_label = (
+                    f" | analyzer_retry={retry_attempt}/{retry_total}"
+                    if retry_attempt is not None and retry_total is not None
+                    else ""
+                )
+                f.write(
+                    f"\n--- {step_label}action={action_num}{retry_label} | "
+                    f"{datetime.now().strftime('%H:%M:%S')} | opencode ---\n"
+                )
+                f.write(f"[SYSTEM PROMPT]\n{prompt}\n\n")
                 f.flush()
 
                 parser = _EventStreamParser(f)
@@ -587,6 +604,13 @@ class OpenCodeAgent:
             hint = parser.accumulated_text.strip() or None
 
             if proc.returncode != 0 or not hint:
+                with open(analyzer_log, "a", encoding="utf-8") as f:
+                    f.write("[ANALYZER STATUS]\n")
+                    f.write(f"return_code: {proc.returncode}\n")
+                    f.write(f"assistant_output_chars: {len(parser.accumulated_text.strip())}\n")
+                    if not hint:
+                        f.write("message: No assistant text or action plan was captured.\n")
+                    f.write("\n")
                 log.warning("action=%d failed: rc=%d, hint_len=%d",
                             action_num, proc.returncode, len(hint) if hint else 0)
                 if self._resume_session:

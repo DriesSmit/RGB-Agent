@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -57,6 +58,9 @@ class GameRunner:
         run_index: int = 1,
         tags: Optional[list[str]] = None,
         prompts_log_path: Optional[Path] = None,
+        full_log_path: Optional[Path] = None,
+        prompt_history_dir: Optional[Path] = None,
+        output_prefix: str = "",
         analyzer=None,
         log_post_board: bool = False,
         analyzer_retries: int = 5,
@@ -69,11 +73,141 @@ class GameRunner:
         self.run_index = run_index
         self.tags = tags
         self.prompts_log_path = prompts_log_path
+        self.full_log_path = full_log_path
+        self.prompt_history_dir = prompt_history_dir
+        self.output_prefix = output_prefix
         self.analyzer = analyzer
         self.log_post_board = log_post_board
         self.analyzer_retries = analyzer_retries
         self._state = GameState(**(agent_kwargs or {}))
         self._queue = ActionQueue()
+        self._analysis_step_counter = 0
+
+    def _append_text(self, path: Optional[Path], text: str) -> None:
+        if not path:
+            return
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(text)
+
+    def _append_prompt_log(self, text: str) -> None:
+        self._append_text(self.prompts_log_path, text)
+        if self.full_log_path and self.full_log_path != self.prompts_log_path:
+            self._append_text(self.full_log_path, text)
+
+    def _append_full_log(self, text: str) -> None:
+        self._append_text(self.full_log_path, text)
+
+    def _analyzer_log_path(self) -> Optional[Path]:
+        if not self.prompts_log_path:
+            return None
+        return Path(tempfile.gettempdir()) / (
+            f"rgb_agent_analyzer_{self.game_id}_{time.time_ns()}.txt"
+        )
+
+    def _read_log_delta(self, path: Optional[Path], start_offset: int) -> str:
+        if not path or not path.exists():
+            return ""
+        with open(path, "r", encoding="utf-8") as f:
+            f.seek(start_offset)
+            return f.read()
+
+    def _write_prompt_history(self, filename: str, content: str, *, append: bool = False) -> None:
+        if not self.prompt_history_dir:
+            return
+        history_path = self.prompt_history_dir / f"{self.output_prefix}{filename}"
+        if append:
+            with open(history_path, "a", encoding="utf-8") as f:
+                f.write(content)
+        else:
+            history_path.write_text(content, encoding="utf-8")
+
+    def _analysis_step_prefix(self, analysis_step: int) -> str:
+        return f"step_{analysis_step}"
+
+    def _write_analysis_step_log(self, analysis_step: int) -> str | None:
+        if not self.prompts_log_path or not self.prompts_log_path.exists():
+            return None
+        filename = f"{self._analysis_step_prefix(analysis_step)}_prompt_log.txt"
+        self._write_prompt_history(filename, self.prompts_log_path.read_text(encoding="utf-8"))
+        return filename
+
+    def _write_analysis_attempt_file(
+        self,
+        *,
+        analysis_step: int,
+        retry_attempt: int | None,
+        retry_total: int | None,
+        action_num: int,
+        arc_score: int,
+        log_snapshot_name: str | None,
+        analyzer_text: str,
+    ) -> None:
+        if retry_attempt is None:
+            return
+        header = (
+            f"Analysis Step: {analysis_step}\n"
+            f"Analyzer Attempt: {retry_attempt}/{retry_total if retry_total is not None else '?'}\n"
+            f"Action Number: {action_num}\n"
+            f"Score Before Attempt: {arc_score}\n"
+            f"Log Snapshot: {log_snapshot_name or 'n/a'}\n\n"
+        )
+        body = analyzer_text.lstrip("\n") if analyzer_text else "[NO ANALYZER TRANSCRIPT CAPTURED]\n"
+        self._write_prompt_history(
+            f"{self._analysis_step_prefix(analysis_step)}_attempt_{retry_attempt}.txt",
+            header + body,
+        )
+
+    def _build_initial_state_log(
+        self,
+        *,
+        level: int,
+        attempt: int,
+        arc_score: int,
+        arc_state: ArcGameState,
+        grid: str,
+    ) -> str:
+        return (
+            f"\n{'=' * 80}\n"
+            f"Action 0 | Level {level} | Attempt {attempt} | INITIAL STATE\n"
+            f"Score: {arc_score} | State: {arc_state.name}\n"
+            f"{'=' * 80}\n\n"
+            f"[INITIAL BOARD STATE]\n{grid}\n\n"
+        )
+
+    def _build_action_log(
+        self,
+        *,
+        action_num: int,
+        level: int,
+        attempt: int,
+        arc_score: int,
+        arc_state: ArcGameState,
+    ) -> str:
+        last_step = self._state.trajectory.steps[-1]
+        plan_info = (
+            f" | Plan Step {self._queue.plan_index}/{self._queue.plan_total}"
+            if self._queue.plan_total > 0 else ""
+        )
+        parts = [
+            f"\n{'=' * 80}",
+            f"Action {action_num} | Level {level} | Attempt {attempt}{plan_info}",
+            f"Score: {arc_score} | State: {arc_state.name}",
+            f"{'=' * 80}",
+            "",
+        ]
+        if last_step.chat_completions:
+            for msg in last_step.chat_completions:
+                role = msg.get("role", "unknown")
+                content = msg.get("content", "")
+                tool_calls = msg.get("tool_calls", [])
+                parts.append(f"[{role.upper()}]")
+                if content:
+                    parts.append(content)
+                for tc in tool_calls:
+                    fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                    parts.append(f"Tool: {fn.get('name', tc)}({fn.get('arguments', '')})")
+                parts.append("")
+        return "\n".join(parts) + "\n"
 
     def _next_action(self) -> dict:
         """Get the next action: auto-reset, queue drain, or raise QueueExhausted."""
@@ -136,6 +270,7 @@ class GameRunner:
         try:
             self._state.reset()
             self._queue.reset()
+            self._analysis_step_counter = 0
 
             # Initial reset
             observation = _run_with_retries(
@@ -150,28 +285,45 @@ class GameRunner:
                 metrics.guid = guid
                 metrics.replay_url = f"{ROOT_URL}/replay/{self.game_id}/{guid}"
                 log.info("[%s Run %d] Replay URL: %s", self.game_id, self.run_index, metrics.replay_url)
-                if self.prompts_log_path:
-                    info_path = self.prompts_log_path.parent / "run_info.txt"
-                    info_path.write_text(
+                if self.prompts_log_path or self.full_log_path:
+                    base_dir = (
+                        self.prompt_history_dir if self.prompt_history_dir
+                        else self.prompts_log_path.parent if self.prompts_log_path
+                        else self.full_log_path.parent
+                    )
+                    info_path = base_dir / f"{self.output_prefix}run_info.txt"
+                    info_text = (
                         f"game_id: {self.game_id}\n"
                         f"guid: {guid}\n"
                         f"replay_url: {metrics.replay_url}\n"
                         f"scorecard_id: {getattr(self.env, '_scorecard_id', 'unknown')}\n"
                         f"command: {Path(sys.argv[0]).name} {' '.join(sys.argv[1:])}\n"
+                        f"prompt_log: {self.prompts_log_path.name if self.prompts_log_path else 'n/a'}\n"
+                        f"step_output_dir: {self.prompt_history_dir.name if self.prompt_history_dir else 'n/a'}\n"
                     )
+                    info_path.write_text(info_text, encoding="utf-8")
+                    if self.full_log_path:
+                        self._append_full_log(
+                            f"{'=' * 80}\n"
+                            "RUN INFO\n"
+                            f"{'=' * 80}\n"
+                            f"{info_text}\n"
+                        )
 
             self._state.record_env_update(observation=observation, reward=0.0, done=False)
 
             # Log initial board
-            if self.prompts_log_path:
+            if self.prompts_log_path or self.full_log_path:
                 grid = self._state.render_board()
                 if grid:
-                    with open(self.prompts_log_path, 'a', encoding='utf-8') as f:
-                        f.write(f"\n{'='*80}\n")
-                        f.write(f"Action 0 | Level {level_num} | Attempt {attempt_num} | INITIAL STATE\n")
-                        f.write(f"Score: {arc_score} | State: {arc_state.name}\n")
-                        f.write(f"{'='*80}\n\n")
-                        f.write(f"[INITIAL BOARD STATE]\n{grid}\n\n")
+                    initial_log = self._build_initial_state_log(
+                        level=level_num,
+                        attempt=attempt_num,
+                        arc_score=arc_score,
+                        arc_state=arc_state,
+                        grid=grid,
+                    )
+                    self._append_prompt_log(initial_log)
 
             # Main game loop
             while total_actions < self.max_actions_per_game:
@@ -179,12 +331,21 @@ class GameRunner:
                     action_dict = self._next_action()
                 except QueueExhausted:
                     log.info("queue exhausted at action %d — firing analyzer", total_actions)
+                    self._analysis_step_counter += 1
+                    analysis_step = self._analysis_step_counter
                     loaded = False
                     for attempt in range(self.analyzer_retries):
                         nudge = _RETRY_NUDGE if attempt > 0 or total_actions > 0 else ""
                         log.info("analyzer attempt %d/%d action=%d nudge=%s",
                                  attempt + 1, self.analyzer_retries, total_actions, bool(nudge))
-                        if self._fire_analyzer(total_actions, arc_score, retry_nudge=nudge):
+                        if self._fire_analyzer(
+                            total_actions,
+                            arc_score,
+                            analysis_step=analysis_step,
+                            retry_nudge=nudge,
+                            retry_attempt=attempt + 1,
+                            retry_total=self.analyzer_retries,
+                        ):
                             loaded = True
                             break
                         log.warning("analyzer attempt %d/%d failed", attempt + 1, self.analyzer_retries)
@@ -209,11 +370,10 @@ class GameRunner:
 
                 self._log_action(total_actions, level_num, attempt_num, arc_score, arc_state)
 
-                if self.log_post_board and self.prompts_log_path:
+                if self.log_post_board and (self.prompts_log_path or self.full_log_path):
                     grid = self._state.render_board()
                     if grid:
-                        with open(self.prompts_log_path, 'a', encoding='utf-8') as f:
-                            f.write(f"[POST-ACTION BOARD STATE]\nScore: {arc_score}\n{grid}\n\n")
+                        self._append_prompt_log(f"[POST-ACTION BOARD STATE]\nScore: {arc_score}\n{grid}\n\n")
 
                 # Level completed
                 if arc_score > prev_score and arc_state not in (ArcGameState.WIN, ArcGameState.GAME_OVER):
@@ -303,16 +463,64 @@ class GameRunner:
 
         return metrics
 
-    def _fire_analyzer(self, action_num: int, arc_score: int, retry_nudge: str = "") -> bool:
+    def _fire_analyzer(
+        self,
+        action_num: int,
+        arc_score: int,
+        analysis_step: int | None = None,
+        retry_nudge: str = "",
+        retry_attempt: int | None = None,
+        retry_total: int | None = None,
+    ) -> bool:
         if not self.analyzer:
             return False
         if self.prompts_log_path and not self.log_post_board:
             grid = self._state.render_board()
             if grid:
-                with open(self.prompts_log_path, 'a', encoding='utf-8') as f:
-                    f.write(f"[POST-ACTION BOARD STATE]\nScore: {arc_score}\n{grid}\n\n")
+                self._append_prompt_log(f"[POST-ACTION BOARD STATE]\nScore: {arc_score}\n{grid}\n\n")
 
-        hint = self.analyzer(self.prompts_log_path, action_num, retry_nudge=retry_nudge)
+        log_snapshot_name = self._write_analysis_step_log(analysis_step) if analysis_step is not None else None
+        analyzer_log_path = self._analyzer_log_path()
+        analyzer_offset = analyzer_log_path.stat().st_size if analyzer_log_path and analyzer_log_path.exists() else 0
+        try:
+            hint = self.analyzer(
+                self.prompts_log_path,
+                action_num,
+                transcript_path=analyzer_log_path,
+                analysis_step=analysis_step,
+                retry_nudge=retry_nudge,
+                retry_attempt=retry_attempt,
+                retry_total=retry_total,
+            )
+            analyzer_delta = self._read_log_delta(analyzer_log_path, analyzer_offset)
+        finally:
+            if analyzer_log_path and analyzer_log_path.exists():
+                analyzer_log_path.unlink(missing_ok=True)
+        step_label = f"Step {analysis_step}" if analysis_step is not None else f"Action {action_num}"
+        retry_label = (
+            f" | Attempt {retry_attempt}/{retry_total}"
+            if retry_attempt is not None and retry_total is not None
+            else ""
+        )
+        analyzer_block = (
+            f"\n{'#' * 80}\n"
+            f"ANALYZER TRANSCRIPT | {step_label}{retry_label} | After Action {action_num}\n"
+            f"{'#' * 80}\n"
+            f"{analyzer_delta.lstrip() if analyzer_delta else '[NO ANALYZER TRANSCRIPT CAPTURED]\\n'}"
+        )
+        if not analyzer_block.endswith("\n"):
+            analyzer_block += "\n"
+        self._append_full_log(analyzer_block)
+        if analysis_step is not None:
+            self._write_analysis_attempt_file(
+                analysis_step=analysis_step,
+                retry_attempt=retry_attempt,
+                retry_total=retry_total,
+                action_num=action_num,
+                arc_score=arc_score,
+                log_snapshot_name=log_snapshot_name,
+                analyzer_text=analyzer_block,
+            )
         if not hint:
             log.warning("analyzer returned None at action %d", action_num)
             return False
@@ -345,24 +553,13 @@ class GameRunner:
 
     def _log_action(self, action_num: int, level: int, attempt: int,
                     arc_score: int, arc_state: ArcGameState) -> None:
-        if not self.prompts_log_path or not self._state.trajectory.steps:
+        if not self._state.trajectory.steps:
             return
-        last_step = self._state.trajectory.steps[-1]
-        with open(self.prompts_log_path, 'a', encoding='utf-8') as f:
-            f.write(f"\n{'='*80}\n")
-            plan_info = f" | Plan Step {self._queue.plan_index}/{self._queue.plan_total}" if self._queue.plan_total > 0 else ""
-            f.write(f"Action {action_num} | Level {level} | Attempt {attempt}{plan_info}\n")
-            f.write(f"Score: {arc_score} | State: {arc_state.name}\n")
-            f.write(f"{'='*80}\n\n")
-            if last_step.chat_completions:
-                for msg in last_step.chat_completions:
-                    role = msg.get('role', 'unknown')
-                    content = msg.get('content', '')
-                    tool_calls = msg.get('tool_calls', [])
-                    f.write(f"[{role.upper()}]\n")
-                    if content:
-                        f.write(f"{content}\n")
-                    for tc in tool_calls:
-                        fn = tc.get('function', {}) if isinstance(tc, dict) else {}
-                        f.write(f"Tool: {fn.get('name', tc)}({fn.get('arguments', '')})\n")
-                    f.write("\n")
+        action_log = self._build_action_log(
+            action_num=action_num,
+            level=level,
+            attempt=attempt,
+            arc_score=arc_score,
+            arc_state=arc_state,
+        )
+        self._append_prompt_log(action_log)

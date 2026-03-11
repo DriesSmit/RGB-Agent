@@ -83,7 +83,7 @@ Rules:
 - Output valid JSON immediately after [ACTIONS].
 - No markdown fences.
 - No extra text after the JSON.
-- Use 1-3 actions whenever possible. Never exceed {plan_size} actions.
+- Prefer 1-2 actions. Only use 3 if the third step is critical. Never exceed {plan_size} actions.
 - ACTION1-4 are moves, ACTION5 is no-op, ACTION6 needs x and y, RESET is allowed.
 - If uncertain, prefer a short probe plan over a long speculative plan.
 """

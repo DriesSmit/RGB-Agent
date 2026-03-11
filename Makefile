@@ -7,6 +7,7 @@
 UV ?= uv
 GAME ?= memory-0001
 MAX_ACTIONS ?= 200
+INTERVAL ?= 3
 MODEL ?= local-qwen
 ENV_SOURCE ?= re_arc
 
@@ -100,4 +101,4 @@ check-server:
 	fi
 
 run: server
-	$(UV) run rgb-swarm --env-source $(ENV_SOURCE) --game $(GAME) --max-actions $(MAX_ACTIONS) --model $(MODEL)
+	$(UV) run rgb-swarm --env-source $(ENV_SOURCE) --game $(GAME) --max-actions $(MAX_ACTIONS) --interval $(INTERVAL) --model $(MODEL)
