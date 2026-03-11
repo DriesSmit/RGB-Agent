@@ -1,0 +1,8 @@
+accelerate>=0.34
+fastapi>=0.115
+pydantic>=2.8
+safetensors>=0.4
+sentencepiece>=0.2
+torch>=2.3
+transformers @ git+https://github.com/huggingface/transformers.git@main
+uvicorn>=0.30

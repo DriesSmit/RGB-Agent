@@ -19,6 +19,19 @@ Your response MUST contain ALL sections below — the agent cannot act without [
 <concise action plan the agent should follow until the next analysis>
 """
 
+COMPACT_INITIAL_PROMPT = """\
+You are planning the next moves for a grid puzzle agent.
+The only file you may read is: {log_path}
+
+Read that file, focus on the latest board and recent score changes, and choose the next short experiment.
+Use Python if needed to parse the board, but keep the response compact.
+
+Reply with exactly these sections and nothing else:
+
+[PLAN]
+1-2 short sentences describing the next experiment.
+"""
+
 RESUME_PROMPT = """\
 The prompt log has grown since your last analysis. The log file is at: {log_path}
 
@@ -35,6 +48,18 @@ Your response MUST contain ALL three sections below — the agent cannot act wit
 <concise action plan the agent should follow until the next analysis>
 """
 
+COMPACT_RESUME_PROMPT = """\
+The prompt log has grown. The only file you may read is: {log_path}
+
+Focus on what changed most recently and choose the next short experiment.
+Use Python if needed to parse the latest board, but keep the response compact.
+
+Reply with exactly these sections and nothing else:
+
+[PLAN]
+1-2 short sentences describing the next experiment.
+"""
+
 ACTIONS_ADDENDUM = """
 3. Followed by exactly this separator and a JSON action plan (REQUIRED — the agent cannot act without this):
 
@@ -48,6 +73,19 @@ because the agent can re-evaluate sooner. Only use more than 5 if you have very 
 confidence AND the extra steps are critical. Even on a clear straight path, prefer
 stopping early so the agent can observe the game's response and adapt.
 \
+"""
+
+COMPACT_ACTIONS_ADDENDUM = """
+[ACTIONS]
+{{"plan": [{{"action": "ACTION1"}}, {{"action": "ACTION6", "x": 3, "y": 7}}], "reasoning": "short reason"}}
+
+Rules:
+- Output valid JSON immediately after [ACTIONS].
+- No markdown fences.
+- No extra text after the JSON.
+- Use 1-3 actions whenever possible. Never exceed {plan_size} actions.
+- ACTION1-4 are moves, ACTION5 is no-op, ACTION6 needs x and y, RESET is allowed.
+- If uncertain, prefer a short probe plan over a long speculative plan.
 """
 
 PYTHON_ADDENDUM = (
@@ -72,6 +110,11 @@ PYTHON_ADDENDUM = (
     "# Now slice, count, compare programmatically\n"
     "```\n"
     "Run Python inline."
+)
+
+COMPACT_PYTHON_ADDENDUM = (
+    "\n\nIf needed, use short inline Python to parse the latest board from "
+    "`{log_path}`. Do not visually read the ASCII grid."
 )
 
 SMALL_MODEL_ADDENDUM = """

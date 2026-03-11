@@ -19,8 +19,12 @@ from typing import IO, Literal, Optional
 from rgb_agent.agent.prompts import (
     INITIAL_PROMPT,
     RESUME_PROMPT,
+    COMPACT_INITIAL_PROMPT,
+    COMPACT_RESUME_PROMPT,
     ACTIONS_ADDENDUM,
+    COMPACT_ACTIONS_ADDENDUM,
     PYTHON_ADDENDUM,
+    COMPACT_PYTHON_ADDENDUM,
     SMALL_MODEL_ADDENDUM,
 )
 
@@ -419,10 +423,13 @@ class OpenCodeAgent:
 
     def _build_prompt(self, log_name: str, analyzer_log_name: str,
                       analyzer_log_exists: bool, is_first: bool) -> str:
+        use_compact = self._model_spec.compact_prompt
         if self._resume_session and not is_first:
-            prompt = RESUME_PROMPT.format(log_path=log_name)
+            base_prompt = COMPACT_RESUME_PROMPT if use_compact else RESUME_PROMPT
+            prompt = base_prompt.format(log_path=log_name)
         else:
-            prompt = INITIAL_PROMPT.format(log_path=log_name)
+            base_prompt = COMPACT_INITIAL_PROMPT if use_compact else INITIAL_PROMPT
+            prompt = base_prompt.format(log_path=log_name)
             if self._allow_self_read and analyzer_log_exists:
                 prompt += (
                     f"\n\nYour previous analysis output is at: {analyzer_log_name}\n"
@@ -430,11 +437,13 @@ class OpenCodeAgent:
                     "Avoid repeating strategies that didn't work."
                 )
         if self._allow_bash:
-            prompt += PYTHON_ADDENDUM.format(log_path=log_name)
-        if self._model_spec.compact_prompt:
+            python_addendum = COMPACT_PYTHON_ADDENDUM if use_compact else PYTHON_ADDENDUM
+            prompt += python_addendum.format(log_path=log_name)
+        if use_compact:
             prompt += SMALL_MODEL_ADDENDUM
         if self._action_mode:
-            prompt += ACTIONS_ADDENDUM.format(plan_size=self._plan_size)
+            action_addendum = COMPACT_ACTIONS_ADDENDUM if use_compact else ACTIONS_ADDENDUM
+            prompt += action_addendum.format(plan_size=self._plan_size)
         return prompt
 
     def _try_recover_text(self, container_name: str, sid: str, sandbox_dir: str) -> str:

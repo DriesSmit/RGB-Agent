@@ -34,6 +34,9 @@ from rgb_agent.metrics.reporting import generate_console_report, save_summary_re
 
 log = logging.getLogger(__name__)
 
+_CONSOLE_LOG_FORMAT = "%(asctime)s | %(levelname)s | %(message)s"
+_FILE_LOG_FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+
 _project_root = Path(__file__).resolve().parents[2]
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
@@ -44,9 +47,22 @@ ROOT_URL = os.environ.get("ROOT_URL", "https://three.arcprize.org")
 _DEFAULT_ANALYZER_MODEL = os.environ.get("RGB_ANALYZER_MODEL", os.environ.get("ARCGYM_ANALYZER_MODEL", "local-qwen"))
 
 _RE_ARC_GAME_ALIASES = {
-    "memory": "simon_tiles-0001",
-    "memory-0001": "simon_tiles-0001",
+    "memory": "memory-0001",
 }
+
+
+def _configure_logging() -> None:
+    logging.basicConfig(level=logging.INFO, format=_CONSOLE_LOG_FORMAT)
+    logging.getLogger("arc_agi").propagate = False
+
+
+def _attach_run_log(run_dir: Path) -> logging.FileHandler:
+    run_log_path = run_dir / "run.log"
+    handler = logging.FileHandler(run_log_path, encoding="utf-8")
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter(_FILE_LOG_FORMAT))
+    logging.getLogger().addHandler(handler)
+    return handler
 
 
 class Swarm:
@@ -232,8 +248,7 @@ def _resolve_re_arc_games(args: argparse.Namespace) -> list[str]:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-    logging.getLogger("arc_agi").propagate = False
+    _configure_logging()
 
     parser = argparse.ArgumentParser(description="Run RGB swarm evaluation.")
     parser.add_argument("--agent", "-a", default="rgb_agent")
@@ -296,88 +311,105 @@ def main() -> None:
             operation_mode=OperationMode(args.operation_mode),
         )
 
-    agent = OpenCodeAgent(
-        model=args.analyzer_model,
-        plan_size=args.analyzer_interval,
-    )
-    log.info("Analyzer enabled (interval=%d, model=%s)", args.analyzer_interval, args.analyzer_model)
-
     timestamp = datetime.now().strftime("%m%dT%H%M%S")
     run_dir = Path("evaluation_results") / f"{timestamp}_{args.env_source}_swarm_{args.agent}"
     run_dir.mkdir(parents=True, exist_ok=True)
+    run_log_handler = _attach_run_log(run_dir)
 
-    inner_agent_kwargs: dict[str, Any] = {
-        "name": args.agent,
-        "plan_size": args.analyzer_interval,
-    }
+    try:
+        log.info("Run log: %s", run_dir / "run.log")
+        log.info(
+            "Run config env_source=%s games=%s model=%s max_actions=%d interval=%d retries=%d",
+            args.env_source,
+            ",".join(games),
+            args.analyzer_model,
+            args.max_actions,
+            args.analyzer_interval,
+            args.analyzer_retries,
+        )
 
-    swarm = Swarm(
-        inner_agent_kwargs=inner_agent_kwargs,
-        env_source=args.env_source,
-        arcade=arcade,
-        games=games,
-        tags=tags,
-        max_actions=args.max_actions,
-        analyzer_hook=agent.analyze,
-        prompts_log_dir=run_dir,
-        log_post_board=True,
-        analyzer_retries=args.analyzer_retries,
-        re_arc_seed=args.re_arc_seed,
-        re_arc_augment=args.re_arc_augment,
-        re_arc_environments_dir=args.re_arc_environments_dir,
-    )
+        agent = OpenCodeAgent(
+            model=args.analyzer_model,
+            plan_size=args.analyzer_interval,
+        )
+        log.info("Analyzer enabled (interval=%d, model=%s)", args.analyzer_interval, args.analyzer_model)
 
-    runner = threading.Thread(target=swarm.run, daemon=True)
-    runner.start()
+        inner_agent_kwargs: dict[str, Any] = {
+            "name": args.agent,
+            "plan_size": args.analyzer_interval,
+        }
 
-    def sigint_handler(sig: int, frame: Any) -> None:
-        print("[Swarm] SIGINT received — cleaning up...", flush=True)
-        sys.exit(1)
+        swarm = Swarm(
+            inner_agent_kwargs=inner_agent_kwargs,
+            env_source=args.env_source,
+            arcade=arcade,
+            games=games,
+            tags=tags,
+            max_actions=args.max_actions,
+            analyzer_hook=agent.analyze,
+            prompts_log_dir=run_dir,
+            log_post_board=True,
+            analyzer_retries=args.analyzer_retries,
+            re_arc_seed=args.re_arc_seed,
+            re_arc_augment=args.re_arc_augment,
+            re_arc_environments_dir=args.re_arc_environments_dir,
+        )
 
-    signal.signal(signal.SIGINT, sigint_handler)
+        runner = threading.Thread(target=swarm.run, daemon=True)
+        runner.start()
 
-    while runner.is_alive():
-        runner.join(timeout=1)
+        def sigint_handler(sig: int, frame: Any) -> None:
+            print("[Swarm] SIGINT received — cleaning up...", flush=True)
+            sys.exit(1)
 
-    results_list = list(swarm.results.values())
+        signal.signal(signal.SIGINT, sigint_handler)
 
-    print(f"\nEnvironment:  {args.env_source}")
-    if swarm.card_id:
-        print(f"Scorecard ID: {swarm.card_id}")
-    print(f"Results:      {run_dir}")
-    for m in sorted(results_list, key=lambda r: r.game_id):
-        if m.replay_url:
-            print(f"  Replay:     {m.replay_url}")
+        while runner.is_alive():
+            runner.join(timeout=1)
 
-    if swarm.scorecard:
-        sc = swarm.scorecard
-        print(f"\n{'='*60}")
-        print(f"ARC Scorecard  —  overall score: {sc.score:.1f}")
-        print(f"  Environments: {sc.total_environments_completed}/{sc.total_environments}")
-        print(f"  Levels:       {sc.total_levels_completed}/{sc.total_levels}")
-        print(f"  Actions:      {sc.total_actions}")
-        for env in sc.environments:
-            run = env.runs[0] if env.runs else None
-            if not run:
-                continue
-            label = env.id or "unknown"
-            state = run.state.name if run.state else "?"
-            print(f"\n  {label}  score={run.score:.1f}  state={state}  actions={run.actions}")
-            if run.level_scores:
-                for i, (ls, la, lb) in enumerate(zip(
-                    run.level_scores,
-                    run.level_actions or [],
-                    run.level_baseline_actions or [],
-                )):
-                    baseline = str(lb) if lb >= 0 else "n/a"
-                    print(f"    Level {i+1}: efficiency={ls:.1f}  actions={la}  baseline={baseline}")
-            if run.message:
-                print(f"    Note: {run.message}")
-        print(f"{'='*60}")
+        results_list = list(swarm.results.values())
 
-        scorecard_path = run_dir / "scorecard.json"
-        scorecard_path.write_text(sc.model_dump_json(indent=2))
-        log.info("Scorecard saved to %s", scorecard_path)
+        print(f"\nEnvironment:  {args.env_source}")
+        if swarm.card_id:
+            print(f"Scorecard ID: {swarm.card_id}")
+        print(f"Results:      {run_dir}")
+        print(f"Run Log:      {run_dir / 'run.log'}")
+        for m in sorted(results_list, key=lambda r: r.game_id):
+            if m.replay_url:
+                print(f"  Replay:     {m.replay_url}")
+
+        if swarm.scorecard:
+            sc = swarm.scorecard
+            print(f"\n{'='*60}")
+            print(f"ARC Scorecard  —  overall score: {sc.score:.1f}")
+            print(f"  Environments: {sc.total_environments_completed}/{sc.total_environments}")
+            print(f"  Levels:       {sc.total_levels_completed}/{sc.total_levels}")
+            print(f"  Actions:      {sc.total_actions}")
+            for env in sc.environments:
+                run = env.runs[0] if env.runs else None
+                if not run:
+                    continue
+                label = env.id or "unknown"
+                state = run.state.name if run.state else "?"
+                print(f"\n  {label}  score={run.score:.1f}  state={state}  actions={run.actions}")
+                if run.level_scores:
+                    for i, (ls, la, lb) in enumerate(zip(
+                        run.level_scores,
+                        run.level_actions or [],
+                        run.level_baseline_actions or [],
+                    )):
+                        baseline = str(lb) if lb >= 0 else "n/a"
+                        print(f"    Level {i+1}: efficiency={ls:.1f}  actions={la}  baseline={baseline}")
+                if run.message:
+                    print(f"    Note: {run.message}")
+            print(f"{'='*60}")
+
+            scorecard_path = run_dir / "scorecard.json"
+            scorecard_path.write_text(sc.model_dump_json(indent=2))
+            log.info("Scorecard saved to %s", scorecard_path)
+    finally:
+        logging.getLogger().removeHandler(run_log_handler)
+        run_log_handler.close()
 
     if results_list:
         generate_console_report(results_list, "swarm", args.agent, 1, scorecard=swarm.scorecard)

@@ -38,6 +38,23 @@ rgb-swarm --env-source re_arc --game memory-0001 --max-actions 200
 rgb-swarm --env-source re_arc --game memory-0001 --analyzer-model opus
 ```
 
+For the local-model path, `make server` now launches the repo's built-in local Qwen server by default, and `make run` depends on it:
+
+```bash
+make server
+make run
+```
+
+The first `make server` run downloads the Qwen weights, so expect startup to take a few minutes before `/v1/models` becomes healthy. Server logs go to `/tmp/rgb-agent-local-server.log`.
+
+Useful overrides:
+
+```bash
+make server LOCAL_SERVER_MODEL=Qwen/Qwen3.5-0.8B
+make server LOCAL_SERVER_DEVICE=cpu
+make run MODEL=opus
+```
+
 ### Key flags
 
 | Flag | Default | Description |
