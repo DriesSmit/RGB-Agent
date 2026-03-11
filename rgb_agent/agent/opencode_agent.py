@@ -5,8 +5,11 @@ import atexit
 import json
 import logging
 import os
+import queue
 import requests
 import shutil
+import shlex
+import socket
 import subprocess
 import tempfile
 import threading
@@ -60,6 +63,10 @@ class _AnalyzerModelSpec:
     provider_config: dict[str, dict]
     compact_prompt: bool = False
     fast_by_default: bool = False
+    docker_network_mode: Literal["bridge", "host"] = "bridge"
+    opencode_print_logs: bool = False
+    opencode_log_level: str | None = None
+    harden_container: bool = True
 
 
 def _local_model_discovery_urls(base_url: str) -> list[str]:
@@ -104,6 +111,46 @@ def _discover_local_model_id(base_url: str) -> str | None:
     return None
 
 
+def _container_local_base_url(base_url: str) -> tuple[str, Literal["bridge", "host"]]:
+    parsed = urlparse(base_url)
+    hostname = (parsed.hostname or "").strip().lower()
+    if hostname not in {"host.docker.internal", "localhost", "127.0.0.1"}:
+        return base_url, "bridge"
+
+    netloc = "127.0.0.1"
+    if parsed.port:
+        netloc = f"{netloc}:{parsed.port}"
+    return urlunparse(parsed._replace(netloc=netloc)), "host"
+
+
+def _find_free_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        return int(sock.getsockname()[1])
+
+
+def _wait_for_container_tcp_port(container_name: str, port: int, timeout_seconds: int = 10) -> bool:
+    probe = (
+        "import socket; "
+        f"s=socket.create_connection(('127.0.0.1',{port}), timeout=1); "
+        "s.close(); "
+        "print('ok')"
+    )
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        result = subprocess.run(
+            ["docker", "exec", container_name, "python3", "-c", probe],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0 and "ok" in result.stdout:
+            return True
+        time.sleep(0.5)
+    return False
+
+
 def _resolve_analyzer_model(model: str) -> _AnalyzerModelSpec:
     requested = (model or "").strip()
     lowered = requested.lower()
@@ -126,7 +173,8 @@ def _resolve_analyzer_model(model: str) -> _AnalyzerModelSpec:
                 discovered_model_id,
             )
 
-        provider_options: dict[str, str] = {"baseURL": base_url}
+        container_base_url, docker_network_mode = _container_local_base_url(base_url)
+        provider_options: dict[str, str] = {"baseURL": container_base_url}
         if os.environ.get("LOCAL_ANALYZER_API_KEY"):
             provider_options["apiKey"] = "{env:LOCAL_ANALYZER_API_KEY}"
 
@@ -154,6 +202,10 @@ def _resolve_analyzer_model(model: str) -> _AnalyzerModelSpec:
             provider_config=provider_config,
             compact_prompt=True,
             fast_by_default=True,
+            docker_network_mode=docker_network_mode,
+            opencode_print_logs=True,
+            opencode_log_level="DEBUG",
+            harden_container=False,
         )
 
     if lowered == "opus":
@@ -164,11 +216,14 @@ def _resolve_analyzer_model(model: str) -> _AnalyzerModelSpec:
     oc_model = requested if "/" in requested else f"anthropic/{requested}"
     provider_id = oc_model.split("/", 1)[0]
     return _AnalyzerModelSpec(
-        oc_model=oc_model,
-        provider_config={provider_id: {}},
-        compact_prompt=False,
-        fast_by_default=False,
-    )
+            oc_model=oc_model,
+            provider_config={provider_id: {}},
+            compact_prompt=False,
+            fast_by_default=False,
+            opencode_print_logs=False,
+            opencode_log_level=None,
+            harden_container=True,
+        )
 
 
 def _docker_image_exists(image: str) -> bool:
@@ -299,11 +354,21 @@ class _EventStreamParser:
 class _ContainerPool:
     """Manages persistent Docker containers running `opencode serve`."""
 
-    def __init__(self, config_path: Path, permission: dict, docker_image: str, sandbox_prefix: str):
+    def __init__(
+        self,
+        config_path: Path,
+        permission: dict,
+        docker_image: str,
+        sandbox_prefix: str,
+        network_mode: Literal["bridge", "host"] = "bridge",
+        harden_container: bool = True,
+    ):
         self._config_path = config_path
         self._permission = permission
         self._image = docker_image
         self._prefix = sandbox_prefix
+        self._network_mode = network_mode
+        self._harden_container = harden_container
         self._containers: dict[str, dict] = {}
         self._lock = threading.Lock()
 
@@ -327,7 +392,7 @@ class _ContainerPool:
         sandbox = tempfile.mkdtemp(prefix=self._prefix)
         os.chmod(sandbox, 0o777)
         name = f"oc_{uuid.uuid4().hex[:12]}"
-        port = 4096
+        port = _find_free_tcp_port() if self._network_mode == "host" else 4096
 
         shutil.copy2(self._config_path, Path(sandbox) / "opencode.json")
 
@@ -346,28 +411,47 @@ class _ContainerPool:
         cmd = [
             "docker", "run", "-d",
             "--name", name,
-            "--read-only",
-            "--user", "1000:1000",
-            "--cap-drop=ALL",
-            "--security-opt=no-new-privileges:true",
-            "--memory=4g", "--cpus=2",
-            "--pids-limit=128",
-            "--shm-size=8m",
-            "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m,uid=1000,gid=1000",
-            "--tmpfs", "/home/opencode:rw,noexec,nosuid,size=128m,uid=1000,gid=1000",
-            "--add-host", "host.docker.internal:host-gateway",
+        ]
+        if self._harden_container:
+            cmd.extend([
+                "--read-only",
+                "--user", "1000:1000",
+                "--cap-drop=ALL",
+                "--security-opt=no-new-privileges:true",
+                "--memory=4g", "--cpus=2",
+                "--pids-limit=128",
+                "--shm-size=8m",
+                "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m,uid=1000,gid=1000",
+                "--tmpfs", "/home/opencode:rw,noexec,nosuid,size=128m,uid=1000,gid=1000",
+            ])
+        cmd.extend([
             "-v", f"{os.path.realpath(sandbox)}:/workspace:rw",
             "-e", "OPENCODE_CONFIG=/workspace/opencode.json",
-            "-e", f"OPENCODE_PERMISSION={json.dumps(self._permission)}",
             *env_flags,
-            self._image,
-            "serve", "--port", str(port), "--hostname", "0.0.0.0",
-        ]
+        ])
+        if self._network_mode == "host":
+            cmd.extend(["--network", "host"])
+        else:
+            cmd.extend(["--add-host", "host.docker.internal:host-gateway"])
+        cmd.append(self._image)
+        cmd.extend(["serve", "--port", str(port), "--hostname", "127.0.0.1" if self._network_mode == "host" else "0.0.0.0"])
 
         subprocess.run(cmd, check=True, capture_output=True, timeout=30)
 
-        for _ in range(15):
+        for _ in range(45):
             time.sleep(1)
+            state = subprocess.run(
+                ["docker", "inspect", "-f", "{{.State.Running}}", name],
+                capture_output=True, text=True, timeout=15,
+            )
+            if state.returncode != 0 or "true" not in state.stdout.lower():
+                logs = subprocess.run(
+                    ["docker", "logs", name], capture_output=True, text=True, timeout=15,
+                )
+                raise RuntimeError(
+                    f"opencode server container {name} exited during startup: "
+                    f"{(logs.stderr or logs.stdout).strip() or 'no logs captured'}"
+                )
             logs = subprocess.run(
                 ["docker", "logs", name], capture_output=True, text=True, timeout=15,
             )
@@ -375,6 +459,8 @@ class _ContainerPool:
                 break
         else:
             log.warning("server %s may not be ready (timeout)", name)
+        if not _wait_for_container_tcp_port(name, port):
+            raise RuntimeError(f"opencode server container {name} did not open port {port} in time")
 
         self._containers[key] = {"name": name, "port": port, "sandbox_dir": sandbox}
         log.info("container ready: %s", name)
@@ -430,36 +516,42 @@ class OpenCodeAgent:
         self._fast = fast
         self._resume_session = resume_session
 
-        permission: dict = {
-            "*": "deny",
-            "read": "allow",
-            "grep": "allow",
-            "bash": {
+        if self._model_spec.harden_container:
+            permission: dict = {
                 "*": "deny",
-                "python3 *": "allow",
-                "python *": "allow",
-            } if allow_bash else "deny",
-            "external_directory": "deny",
-            "doom_loop": "allow",
-            "question": "deny",
-            "edit": "deny",
-            "write": "deny",
-            "patch": "deny",
-            "glob": "deny",
-            "list": "deny",
-            "lsp": "deny",
-            "skill": "deny",
-            "webfetch": "deny",
-            "websearch": "deny",
-            "todowrite": "deny",
-            "todoread": "deny",
-        }
+                "read": "allow",
+                "grep": "allow",
+                "bash": {
+                    "*": "deny",
+                    "python3 *": "allow",
+                    "python *": "allow",
+                } if allow_bash else "deny",
+                "external_directory": "deny",
+                "doom_loop": "allow",
+                "question": "deny",
+                "edit": "deny",
+                "write": "deny",
+                "patch": "deny",
+                "glob": "deny",
+                "list": "deny",
+                "lsp": "deny",
+                "skill": "deny",
+                "webfetch": "deny",
+                "websearch": "deny",
+                "todowrite": "deny",
+                "todoread": "deny",
+            }
+        else:
+            permission = {
+                "*": "deny",
+                "read": "allow",
+                "grep": "allow",
+            }
 
         config = {
             "model": self._oc_model,
             "provider": self._model_spec.provider_config,
             "permission": permission,
-            "agent": {"build": {"steps": 50}},
         }
 
         config_dir = tempfile.mkdtemp(prefix="opencode_analyzer_")
@@ -467,7 +559,14 @@ class OpenCodeAgent:
         config_path.write_text(json.dumps(config, indent=2))
         atexit.register(shutil.rmtree, config_dir, True)
 
-        self._pool = _ContainerPool(config_path, permission, _DOCKER_IMAGE, f"oc_sandbox_{uuid.uuid4().hex[:8]}_")
+        self._pool = _ContainerPool(
+            config_path,
+            permission,
+            _DOCKER_IMAGE,
+            f"oc_sandbox_{uuid.uuid4().hex[:8]}_",
+            network_mode=self._model_spec.docker_network_mode,
+            harden_container=self._model_spec.harden_container,
+        )
         atexit.register(self._pool.cleanup)
 
         self._session_ids: dict[str, str] = {}
@@ -566,16 +665,27 @@ class OpenCodeAgent:
             if retry_nudge:
                 prompt += f"\n\n{retry_nudge}"
 
-            oc_args = ["run", "--attach", f"http://127.0.0.1:{server_port}"]
+            oc_args: list[str] = []
+            if self._model_spec.opencode_print_logs:
+                oc_args.append("--print-logs")
+            if self._model_spec.opencode_log_level:
+                oc_args.extend(["--log-level", self._model_spec.opencode_log_level])
+            oc_args.extend(["run", "--attach", f"http://127.0.0.1:{server_port}"])
             if self._resume_session and not is_first and current_sid:
                 oc_args.extend(["--session", current_sid, "--continue"])
             oc_args.extend(["--model", self._oc_model])
             if self._fast or self._model_spec.fast_by_default:
                 oc_args.extend(["--variant", "minimal"])
             oc_args.extend(["--format", "json", "--dir", "/workspace"])
-            oc_args.append(prompt)
+            prompt_file_name = f"_opencode_prompt_{time.time_ns()}.txt"
+            prompt_path = sandbox / prompt_file_name
+            prompt_path.write_text(prompt, encoding="utf-8")
+            shell_cmd = (
+                f"{shlex.join(['opencode', *oc_args])} "
+                f'"$(cat {shlex.quote(f"/workspace/{prompt_file_name}")})"'
+            )
 
-            cmd = ["docker", "exec", container_name, "opencode", *oc_args]
+            cmd = ["docker", "exec", container_name, "sh", "-lc", shell_cmd]
             log.info("exec %s model=%s%s", container_name, self._oc_model,
                      f" session={current_sid}" if current_sid else "")
 
@@ -610,16 +720,37 @@ class OpenCodeAgent:
 
                 parser = _EventStreamParser(f)
                 deadline = time.monotonic() + self._timeout if self._timeout is not None else None
+                assert proc.stdout is not None
+                stdout_queue: queue.Queue[str | None] = queue.Queue()
+
+                def drain_stdout() -> None:
+                    for stdout_line in proc.stdout:
+                        stdout_queue.put(stdout_line)
+                    stdout_queue.put(None)
+
+                stdout_thread = threading.Thread(target=drain_stdout, daemon=True)
+                stdout_thread.start()
+                stdout_open = True
 
                 while True:
-                    line = proc.stdout.readline()
-                    if not line:
-                        break
                     if deadline is not None and time.monotonic() > deadline:
                         proc.kill()
                         f.write("[TIMEOUT]\n")
                         log.warning("timed out at action %d", action_num)
                         return None
+
+                    try:
+                        line = stdout_queue.get(timeout=1.0)
+                    except queue.Empty:
+                        if proc.poll() is not None and not stdout_open:
+                            break
+                        continue
+
+                    if line is None:
+                        stdout_open = False
+                        if proc.poll() is not None:
+                            break
+                        continue
 
                     line = line.rstrip("\n")
                     if not line.strip():
@@ -631,6 +762,7 @@ class OpenCodeAgent:
                         f.flush()
 
                 proc.wait()
+                stdout_thread.join(timeout=5)
                 stderr_thread.join(timeout=5)
                 if stderr_lines:
                     f.write(f"\n--- STDERR ---\n{''.join(l + chr(10) for l in stderr_lines)}")
@@ -680,3 +812,6 @@ class OpenCodeAgent:
         except Exception as e:
             log.error("unexpected error: %s", e, exc_info=True)
             return None
+        finally:
+            if 'prompt_path' in locals() and prompt_path.exists():
+                prompt_path.unlink(missing_ok=True)
