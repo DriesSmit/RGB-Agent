@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := run
 
-.PHONY: install server stop-server check-server run
+.PHONY: install server stop-server check-server run chat
 
 -include .env
 
@@ -31,6 +31,14 @@ LOCAL_SERVER_TOP_P ?= 0.95
 LOCAL_SERVER_LOG ?= /tmp/rgb-agent-local-server.log
 LOCAL_SERVER_PID ?= /tmp/rgb-agent-local-server.pid
 LOCAL_SERVER_REQUIREMENTS ?= local_server/requirements.txt
+CHAT_BASE_URL ?= http://127.0.0.1:$(SERVER_PORT)/v1
+CHAT_MODEL ?= auto
+CHAT_MAX_TOKENS ?= $(LOCAL_SERVER_MAX_TOKENS)
+CHAT_TEMPERATURE ?= $(LOCAL_SERVER_TEMPERATURE)
+CHAT_TOP_P ?= $(LOCAL_SERVER_TOP_P)
+CHAT_TIMEOUT ?= 600
+CHAT_SYSTEM ?=
+PROMPT ?=
 
 export LOCAL_ANALYZER_BASE_URL
 export LOCAL_ANALYZER_MODEL_ID
@@ -102,3 +110,14 @@ check-server:
 
 run: server
 	$(UV) run rgb-swarm --env-source $(ENV_SOURCE) --game $(GAME) --max-actions $(MAX_ACTIONS) --interval $(INTERVAL) --model $(MODEL)
+
+chat: server
+	$(UV) run python -m rgb_agent.tools.chat \
+		--base-url "$(CHAT_BASE_URL)" \
+		--model "$(CHAT_MODEL)" \
+		--max-tokens "$(CHAT_MAX_TOKENS)" \
+		--temperature "$(CHAT_TEMPERATURE)" \
+		--top-p "$(CHAT_TOP_P)" \
+		--timeout "$(CHAT_TIMEOUT)" \
+		$(if $(CHAT_SYSTEM),--system "$(CHAT_SYSTEM)") \
+		$(if $(PROMPT),--prompt "$(PROMPT)")

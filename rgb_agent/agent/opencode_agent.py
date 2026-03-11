@@ -5,6 +5,7 @@ import atexit
 import json
 import logging
 import os
+import requests
 import shutil
 import subprocess
 import tempfile
@@ -15,6 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import IO, Literal, Optional
+from urllib.parse import urlparse, urlunparse
 
 from rgb_agent.agent.prompts import (
     INITIAL_PROMPT,
@@ -60,19 +62,69 @@ class _AnalyzerModelSpec:
     fast_by_default: bool = False
 
 
+def _local_model_discovery_urls(base_url: str) -> list[str]:
+    candidates: list[str] = []
+
+    def _add(url: str) -> None:
+        normalized = url.rstrip("/")
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+
+    _add(base_url)
+
+    parsed = urlparse(base_url)
+    hostname = parsed.hostname or ""
+    if hostname == "host.docker.internal":
+        for alt_host in ("127.0.0.1", "localhost"):
+            replacement = parsed._replace(netloc=f"{alt_host}:{parsed.port}" if parsed.port else alt_host)
+            _add(urlunparse(replacement))
+
+    return candidates
+
+
+def _discover_local_model_id(base_url: str) -> str | None:
+    headers: dict[str, str] = {}
+    api_key = os.environ.get("LOCAL_ANALYZER_API_KEY", "").strip()
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    for candidate in _local_model_discovery_urls(base_url):
+        models_url = f"{candidate}/models"
+        try:
+            response = requests.get(models_url, headers=headers, timeout=3)
+            response.raise_for_status()
+            payload = response.json()
+            models = payload.get("data", [])
+            for model in models:
+                model_id = str(model.get("id", "")).strip()
+                if model_id:
+                    return model_id
+        except Exception as exc:
+            log.debug("local model discovery failed via %s: %s", models_url, exc)
+    return None
+
+
 def _resolve_analyzer_model(model: str) -> _AnalyzerModelSpec:
     requested = (model or "").strip()
     lowered = requested.lower()
 
     if lowered in {"local", "local-qwen", "qwen-local", "qwen"}:
-        model_id = os.environ.get("LOCAL_ANALYZER_MODEL_ID", _LOCAL_ANALYZER_MODEL_ID).strip()
-        if not model_id:
-            raise ValueError("LOCAL_ANALYZER_MODEL_ID must be set for the local analyzer preset.")
-
         provider_id = os.environ.get("LOCAL_ANALYZER_PROVIDER", _LOCAL_ANALYZER_PROVIDER).strip() or "local"
         base_url = os.environ.get("LOCAL_ANALYZER_BASE_URL", _LOCAL_ANALYZER_BASE_URL).strip()
         if not base_url:
             raise ValueError("LOCAL_ANALYZER_BASE_URL must be set for the local analyzer preset.")
+
+        configured_model_id = os.environ.get("LOCAL_ANALYZER_MODEL_ID", _LOCAL_ANALYZER_MODEL_ID).strip()
+        discovered_model_id = _discover_local_model_id(base_url)
+        model_id = discovered_model_id or configured_model_id
+        if not model_id:
+            raise ValueError("LOCAL_ANALYZER_MODEL_ID must be set for the local analyzer preset.")
+        if discovered_model_id and discovered_model_id != configured_model_id:
+            log.info(
+                "Local analyzer model id mismatch: configured=%s discovered=%s; using discovered",
+                configured_model_id or "<unset>",
+                discovered_model_id,
+            )
 
         provider_options: dict[str, str] = {"baseURL": base_url}
         if os.environ.get("LOCAL_ANALYZER_API_KEY"):
