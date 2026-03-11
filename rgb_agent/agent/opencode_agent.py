@@ -786,6 +786,7 @@ class OpenCodeAgent:
                 f.flush()
 
             hint = parser.accumulated_text.strip() or None
+            missing_actions = bool(hint and self._action_mode and "[ACTIONS]" not in hint)
 
             if proc.returncode != 0 or not hint:
                 with open(analyzer_log, "a", encoding="utf-8") as f:
@@ -802,7 +803,12 @@ class OpenCodeAgent:
                         self._session_ids.pop(path_key, None)
                 return None
 
-            if self._resume_session and parser.session_id:
+            if missing_actions and self._resume_session:
+                log.info("clearing session for %s because response omitted [ACTIONS]", path_key)
+                with self._session_lock:
+                    self._session_ids.pop(path_key, None)
+
+            if self._resume_session and parser.session_id and not missing_actions:
                 with self._session_lock:
                     self._session_ids[path_key] = parser.session_id
 
